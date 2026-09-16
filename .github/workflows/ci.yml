@@ -4,14 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  changes:
+  plan:
     runs-on: ubuntu-latest
     outputs:
-      src: ${{ steps.filter.outputs.src }}
-      workflows: ${{ steps.filter.outputs.workflows }}
+      plan: ${{ steps.plan.outputs.plan }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -22,21 +25,57 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Detect changed paths
-        id: filter
+      - name: Create test plan
+        id: plan
         env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          if [ -n "$BASE" ]; then
-            bun .github/scripts/paths-filter.ts --base "$BASE"
-          else
-            bun .github/scripts/paths-filter.ts
+          if [ -n "$PR" ]; then
+            bun .github/scripts/test-plan.ts create --pr "$PR" --repo "$GITHUB_REPOSITORY"
+            exit 0
           fi
 
-  test:
-    needs: changes
-    if: needs.changes.outputs.src == 'true'
-    uses: ./.github/workflows/test.yml
+          args=(--event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF_NAME" --default-branch "$DEFAULT_BRANCH")
+
+          # A brand new branch has no `before` commit to diff against.
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            args+=(--base "$BEFORE")
+          fi
+
+          bun .github/scripts/test-plan.ts create "${args[@]}"
 
   lint:
+    needs: plan
+    if: fromJSON(needs.plan.outputs.plan || '{}').workflows.ci.jobs.lint.run
     uses: ./.github/workflows/lint.yml
+
+  test:
+    needs: plan
+    if: fromJSON(needs.plan.outputs.plan || '{}').workflows.ci.jobs.test.run
+    uses: ./.github/workflows/test.yml
+
+  # The only required check. It passes when the run did exactly what the plan
+  # asked for: every planned job succeeded, and every job the plan ruled out
+  # was skipped. Any job named in .github/test-plan.yaml must appear in `needs`
+  # here, or the check fails saying so.
+  required:
+    needs: [plan, lint, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Verify the plan was carried out
+        env:
+          PLAN: ${{ needs.plan.outputs.plan }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$PLAN" |
+            bun .github/scripts/test-plan.ts verify --plan - --workflow ci --results "$RESULTS"
