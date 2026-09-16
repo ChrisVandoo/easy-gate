@@ -7,7 +7,35 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Enough history to diff against the base of the pull request.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Detect changed paths
+        id: filter
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+        run: |
+          if [ -n "$BASE" ]; then
+            bun .github/scripts/paths-filter.ts --base "$BASE"
+          else
+            bun .github/scripts/paths-filter.ts
+          fi
+
   test:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     uses: ./.github/workflows/test.yml
 
   lint:

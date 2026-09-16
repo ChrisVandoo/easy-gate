@@ -1,0 +1,12 @@
+# Groups of path globs, in the style of dorny/paths-filter.
+# A group is "changed" when any file in the diff matches one of its globs.
+src:
+  - src/**
+  - package.json
+  - bun.lock
+  - tsconfig.json
+  - .github/scripts/**
+
+workflows:
+  - .github/workflows/**
+  - .github/paths-filter.yaml

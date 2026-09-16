@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "start": "bun run src/index.ts",
-    "test": "bun test",
+    "test": "bun test ./src ./.github/scripts",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit"
