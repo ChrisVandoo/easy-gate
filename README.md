@@ -36,8 +36,20 @@ In order:
 | --- | --- |
 | `skip-all` label | nothing runs |
 | `force-run` label | everything runs, whatever changed |
+| nothing to diff against | everything runs — a new branch, or a root commit |
 | push to `main` | everything runs |
 | otherwise | each job runs if its [path groups](.github/paths-filter.yaml) changed |
+
+An override settles every job on its own, so when one applies `create` never
+works the diff out at all — no `git diff` on the default branch, no `gh pr diff`
+behind `force-run` or `skip-all`. The plan records `changedFiles: null` to say
+the question was never asked, which is different from asking and finding
+nothing. This falls out of the types: predicates take `PlanContext`, which has
+no diff in it, so a predicate cannot come to depend on one by accident.
+
+Recognising that there is nothing to diff against is the tool's job too, not the
+workflow's: `create` treats an all-zero `--base` (what a push reports when it
+creates the branch) and a commit with no parent as the same case.
 
 The required check runs in every one of those cases, including `skip-all`, so a
 pull request is always mergeable on its own terms rather than stuck waiting for
@@ -64,7 +76,7 @@ workflows:
 
 A job with no `paths` is unconditional; `exempt: true` opts it out of overrides
 and filters entirely. An override's `when` is an AND of predicates — `labels`,
-`event`, `defaultBranch`, `draft` today. Adding a new input means adding one
+`event`, `defaultBranch`, `firstCommit`, `draft` today. Adding a new input means adding one
 entry to `PREDICATES` in [`.github/scripts/test-plan.ts`](.github/scripts/test-plan.ts)
 and one field to `PlanInputs`; nothing else in the pipeline changes.
 
@@ -80,8 +92,11 @@ Same code path locally and in CI, so a local plan and a CI plan agree.
 # What will CI do for this pull request?
 bun run plan create --pr 9
 
+# ...or the same pull request as if it were labelled force-run
+bun run plan create --pr 9 --label force-run
+
 # ...or for the working tree, with inputs spelled out
-bun run plan create --event pull_request --base main --label force-run
+bun run plan create --event pull_request --base main --ref my-branch
 
 # Should one job run, given a plan?
 bun run plan execute --plan plan.json --workflow ci --job test   # -> true | false
@@ -91,8 +106,9 @@ bun run plan verify --plan plan.json --workflow ci --results "$NEEDS"
 ```
 
 `create` takes `--pr` (via `gh`) or `--event` / `--ref` / `--base` / `--head` /
-`--label` / `--default-branch`, and writes the plan to `--out` and to
-`GITHUB_OUTPUT`. `execute` prints `true` or `false` with the reason on stderr.
+`--default-branch`, and writes the plan to `--out` and to `GITHUB_OUTPUT`.
+`--label` works with both: on a pull request it adds to the labels the API
+reports, so you can try a label out without setting it. `execute` prints `true` or `false` with the reason on stderr.
 `verify` exits non-zero when a planned job did not succeed, when a job the plan
 ruled out ran anyway, or when a planned job never reached the gate's `needs`.
 

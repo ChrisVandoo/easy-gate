@@ -35,17 +35,13 @@ jobs:
         run: |
           if [ -n "$PR" ]; then
             bun .github/scripts/test-plan.ts create --pr "$PR" --repo "$GITHUB_REPOSITORY"
-            exit 0
+          else
+            bun .github/scripts/test-plan.ts create \
+              --event "$GITHUB_EVENT_NAME" \
+              --ref "$GITHUB_REF_NAME" \
+              --base "$BEFORE" \
+              --default-branch "$DEFAULT_BRANCH"
           fi
-
-          args=(--event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF_NAME" --default-branch "$DEFAULT_BRANCH")
-
-          # A brand new branch has no `before` commit to diff against.
-          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-            args+=(--base "$BEFORE")
-          fi
-
-          bun .github/scripts/test-plan.ts create "${args[@]}"
 
   lint:
     needs: plan

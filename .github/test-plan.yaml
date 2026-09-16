@@ -1,0 +1,70 @@
+# The test plan: which workflows run, and which jobs inside them, for a given
+# branch / event / set of labels / set of changed files.
+#
+# `bun .github/scripts/test-plan.ts create` turns this file plus a set of
+# inputs into a concrete plan; CI and `... execute` then read that plan rather
+# than re-deriving the decision, so a local run and a CI run always agree.
+
+# Blanket decisions, checked in order — the first whose `when` matches wins and
+# applies to every job that is not `exempt`.
+#
+# `when` is an AND of predicates. The available predicates are defined by
+# PREDICATES in .github/scripts/test-plan.ts; adding a new input means adding
+# one entry there and using it here. Today:
+#   labels:        <list>  — true when the PR carries any of these labels
+#   event:         <list>  — true when the triggering event is one of these
+#   defaultBranch: <bool>  — true when the ref is the repo's default branch
+#   firstCommit:   <bool>  — true when there is no base commit to diff against
+#   draft:         <bool>  — true when the PR is a draft
+overrides:
+  - id: skip-all
+    when:
+      labels: [skip-all]
+    decision: skip
+    reason: skip-all label is set
+
+  - id: force-run
+    when:
+      labels: [force-run]
+    decision: run
+    reason: force-run label is set
+
+  - id: first-commit
+    when:
+      firstCommit: true
+    decision: run
+    reason: nothing to diff against, so everything runs
+
+  - id: default-branch
+    when:
+      defaultBranch: true
+    decision: run
+    reason: pushes to the default branch always run everything
+
+# Every workflow the plan governs, and the jobs inside it.
+#
+# A job runs when any of its `paths` groups changed. The groups come from
+# .github/paths-filter.yaml, and an unknown group is an error. A job with no
+# `paths` is unconditional. A workflow runs when any of its jobs run.
+#
+#   exempt: true  — always runs, ignoring overrides and path filters
+#   gate:   true  — implies exempt, and excludes the job from verification
+#                   (this is the job that does the verifying)
+workflows:
+  ci:
+    jobs:
+      plan:
+        exempt: true
+      lint:
+        paths: [src, workflows]
+      test:
+        paths: [src]
+      required:
+        gate: true
+
+  info:
+    jobs:
+      plan:
+        exempt: true
+      debug:
+        paths: [workflows]
