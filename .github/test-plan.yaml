@@ -1,10 +1,11 @@
 # TEST PLAN SYNTAX 
-#   - overrides ALWAYS take precedence over workflow level settings
-#   - default: `condition: all` for skip and run blocks
-#     for example: a label `skip-all` AND this is a PR == this job is skipped
-#   - optionally can specify `condition: any` in which case if any of label, 
-#     event, branch, or path matches skip/run will execute
-#   - if run and skip both match, run ALWAYS takes precedence and the job/workflow will run
+#  - overrides ALWAYS take precedence over workflow level settings
+#  - default: `condition: all` for skip and run blocks
+#    for example: a label `skip-all` AND this is a PR == this job is skipped
+#  - optionally can specify `condition: any` in which case if any of label, 
+#    event, branch, or path matches skip/run will execute
+#  - if run and skip both match, run ALWAYS takes precedence and the job/workflow will run
+#  - force-skip ALWAYS takes precedence over run and skips the job or workflow
 
 overrides:
   - id: skip-all
@@ -37,7 +38,7 @@ workflows:
     jobs:
       lint:
         run:
-          path: [src, workflows]
+          paths: [src, workflows]
 
   test:
     jobs:
@@ -46,7 +47,5 @@ workflows:
           condition: any
           paths: [src]
           labels: [deep-test]
-        skip:
-          labels: [no-test]
-          event: 
-            pull_request: [labelled]
+        force-skip:
+          labels: [no-tests]
