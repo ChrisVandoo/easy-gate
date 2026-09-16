@@ -43,41 +43,12 @@ jobs:
 
   lint:
     needs: plan
-    if: fromJSON(needs.plan.outputs.plan || '{}').workflows.ci.jobs.lint.run
     uses: ./.github/workflows/lint.yml
-    # The plan travels down with the call: the called workflow filters its own
-    # jobs against it and verifies them, rather than working any of it out again.
     with:
-      plan: ${{ needs.plan.outputs.plan }}
+      plan: ${{ needs.plan.outputs.plan || '{}' }}
 
   test:
     needs: plan
-    if: fromJSON(needs.plan.outputs.plan || '{}').workflows.ci.jobs.test.run
     uses: ./.github/workflows/test.yml
-    # The plan travels down with the call: the called workflow filters its own
-    # jobs against it and verifies them, rather than working any of it out again.
     with:
-      plan: ${{ needs.plan.outputs.plan }}
-
-  # The only required check. It passes when the run did exactly what the plan
-  # asked for: every planned job succeeded, and every job the plan ruled out
-  # was skipped. Any job named in .github/test-plan.yaml must appear in `needs`
-  # here, or the check fails saying so.
-  required:
-    needs: [plan, lint, test]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Verify the plan was carried out
-        env:
-          PLAN: ${{ needs.plan.outputs.plan }}
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          printf '%s' "$PLAN" |
-            bun .github/scripts/test-plan.ts verify --plan - --workflow ci --results "$RESULTS"
+      plan: ${{ needs.plan.outputs.plan || '{}' }}

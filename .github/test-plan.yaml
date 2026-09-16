@@ -1,109 +1,52 @@
-# The test plan: which workflows run, and which jobs inside them, for a given
-# branch / event / set of labels / set of changed files.
-#
-# `bun .github/scripts/test-plan.ts create` turns this file plus a set of
-# inputs into a concrete plan; CI and `... execute` then read that plan rather
-# than re-deriving the decision, so a local run and a CI run always agree.
+# TEST PLAN SYNTAX 
+#   - overrides ALWAYS take precedence over workflow level settings
+#   - default: `condition: all` for skip and run blocks
+#     for example: a label `skip-all` AND this is a PR == this job is skipped
+#   - optionally can specify `condition: any` in which case if any of label, 
+#     event, branch, or path matches skip/run will execute
+#   - if run and skip both match, run ALWAYS takes precedence and the job/workflow will run
 
-# Blanket decisions, checked in order — the first whose `when` matches wins and
-# applies to every job that is not `exempt`.
-#
-# `when` is an AND of predicates. The available predicates are defined by
-# PREDICATES in .github/scripts/test-plan.ts; adding a new input means adding
-# one entry there and using it here. Today:
-#   labels: <list>  — true when the PR carries any of these labels
-#   branch: <list>  — true when the branch under test is one of these
-#   event:  <list>  — true when the triggering event is one of these
-#   draft:  <bool>  — true when the PR is a draft
-#
-# `labels` and `branch` take globs, so an entry is either a plain name, which
-# matches exactly, or a pattern: `release/*` matches `release/1.2` but not
-# `release/1.2/hotfix`, and `release/**` matches both. The branch under test is
-# the one the commits are on — for a pull request that is the head branch, not
-# the branch it will merge into.
 overrides:
   - id: skip-all
-    when:
+    skip:
       labels: [skip-all]
-    decision: skip
+      event: [pull_request]
     reason: skip-all label is set
 
   - id: force-run
-    when:
+    run:
       labels: [force-run]
-    decision: run
+      event: [pull_request]
     reason: force-run label is set
 
   - id: protected-branch
-    when:
+    run:
       branch: [main, "release/**"]
-    decision: run
     reason: pushes to a protected branch always run everything
 
-# Nothing here covers a diff that cannot be worked out — a brand new branch, a
-# force-pushed base, a clone too shallow to reach it. That is not a property of
-# the inputs, so it is not an override: `create` tries the diff, and if it
-# fails the plan runs everything and records why.
-
-# Every workflow the plan governs, and the jobs inside it — including the ones
-# a workflow calls, so that this file is the whole picture and nothing decides
-# whether it runs anywhere else.
-#
-# A job runs when any of its `paths` groups changed. The groups come from
-# .github/paths-filter.yaml, and an unknown group is an error. A job with no
-# `paths` is unconditional. A workflow runs when any of its jobs run.
-#
-#   when:   <list>  — run this job whatever the diff says, whenever any entry
-#                     matches. Each entry is a `when` mapping exactly as an
-#                     override takes one, so the same predicates are available;
-#                     the list is an OR, since each entry is another reason to
-#                     want this job. Asking for a job — by label, usually —
-#                     outranks a blanket skip, so a job asked for here runs
-#                     even under skip-all. It can only turn a job on: an entry
-#                     that does not match leaves the path filter to decide.
-#   calls:  <name>  — for a job whose body is `uses:`, the workflow it calls.
-#                     It decides nothing of its own, so nothing else may sit
-#                     beside it: it runs exactly when that workflow has work in
-#                     it, which its jobs below settle. A called workflow needs
-#                     a `gate` of its own, because a caller's `needs` only ever
-#                     sees the called workflow's overall result — never the
-#                     jobs inside it — so it cannot verify them.
-#   exempt: true    — always runs, ignoring overrides and path filters
-#   gate:   true    — implies exempt, and excludes the job from verification
-#                     (this is the job that does the verifying)
+# maps workflow calls and conditions for running jobs
 workflows:
   ci:
     jobs:
-      plan:
-        exempt: true
       lint:
         calls: lint
       test:
         calls: test
-      required:
-        gate: true
 
   lint:
     jobs:
       lint:
-        paths: [src, workflows]
-      verify:
-        gate: true
+        run:
+          path: [src, workflows]
 
   test:
     jobs:
       test:
-        paths: [src]
-        when:
-          - labels: [deep-test]
-      verify:
-        gate: true
-
-  info:
-    jobs:
-      plan:
-        exempt: true
-      debug:
-        paths: [workflows]
-        when:
-          - labels: [debug]
+        run:
+          condition: any
+          paths: [src]
+          labels: [deep-test]
+        skip:
+          labels: [no-test]
+          event: 
+            pull_request: [labelled]
