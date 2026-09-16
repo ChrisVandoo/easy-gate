@@ -2,12 +2,20 @@ name: Lint
 
 on:
   workflow_call:
+    inputs:
+      plan:
+        description: >-
+          The test plan, as JSON. The caller builds it; the `lint` workflow
+          in it decides the jobs below, and the gate checks them against it.
+        type: string
+        required: true
 
 jobs:
   lint:
+    if: fromJSON(inputs.plan).workflows.lint.jobs.lint.run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -18,3 +26,26 @@ jobs:
 
       - name: Lint
         run: bun run lint
+
+  # A called workflow carries its own gate. The caller's `needs` context only
+  # ever holds this workflow's overall result, never the jobs inside it, so the
+  # caller cannot check them — this job does, and a mismatch surfaces upward as
+  # this workflow failing.
+  verify:
+    needs: [lint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Verify the plan was carried out
+        env:
+          PLAN: ${{ inputs.plan }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$PLAN" |
+            bun .github/scripts/test-plan.ts verify --plan - --workflow lint --results "$RESULTS"

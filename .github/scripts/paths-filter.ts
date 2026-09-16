@@ -13,7 +13,7 @@
  */
 
 /** The empty tree, used as the base when HEAD has no parent. */
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 export type Filters = Record<string, string[]>;
 
@@ -64,6 +64,12 @@ function git(args: string[]): string {
   return result.stdout.toString();
 }
 
+/** The base to diff `head` against when none was given: its parent, or, for a
+ * root commit, nothing at all. */
+export function defaultBase(head: string): string {
+  return revExists(`${head}^`) ? `${head}^` : EMPTY_TREE;
+}
+
 function revExists(ref: string): boolean {
   return (
     Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", ref]).exitCode ===
@@ -103,9 +109,7 @@ async function main(): Promise<void> {
   const options = parseArgs(Bun.argv.slice(2));
   const configPath = options.config ?? ".github/paths-filter.yaml";
   const head = options.head ?? "HEAD";
-  // A root commit has no parent, so fall back to diffing against nothing.
-  const base =
-    options.base ?? (revExists(`${head}^`) ? `${head}^` : EMPTY_TREE);
+  const base = options.base ?? defaultBase(head);
 
   const filters = parseFilters(await Bun.file(configPath).text());
   const files = changedFiles(base, head);
