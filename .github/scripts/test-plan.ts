@@ -8,19 +8,14 @@
  * instead of re-deriving the answer, so there is a single place where "does
  * this run?" is decided and a single artefact to look at when it surprises you.
  *
- * Usage:
- *   test-plan.ts create  [--pr <n>] [--event <e>] [--ref <r>] [--label <l>]...
- *                        [--base <ref>] [--head <ref>]
- *                        [--repo <owner/name>] [--config <p>] [--filters <p>]
- *                        [--out <path>] [--format json|text]
- *   test-plan.ts execute --plan <path|-> --workflow <w> [--job <j>]
- *   test-plan.ts verify  --plan <path|-> --workflow <w> --results <json>
- *
  * `create` resolves its inputs from a pull request (--pr, via gh) or from the
  * flags directly, so the same command run on a laptop and in CI produces the
  * same plan. `execute` answers a single should-this-run question. `verify` is
  * the required check: it takes the plan and the `needs` context and confirms
  * every job the plan asked for actually ran and passed.
+ *
+ * The flags live with the commands themselves, at the bottom of this file:
+ * run `test-plan.ts --help`, or `test-plan.ts <command> --help`.
  */
 
 import {
@@ -820,7 +815,7 @@ function localSource(
       ref,
       baseRef: one(options, "base-ref") ?? null,
       draft: false,
-      labels: options.label ?? [],
+      labels: many(options, "label"),
     },
     diff: () => toDiff(changedFiles(base, head)),
   };
@@ -874,6 +869,11 @@ function one(options: Options, flag: string): string | undefined {
   }
 
   return values?.[0];
+}
+
+/** Every value given for a repeatable flag, in the order they were given. */
+function many(options: Options, flag: string): string[] {
+  return options[flag] ?? [];
 }
 
 function required(options: Options, flag: string): string {
@@ -969,7 +969,12 @@ async function createCommand(options: Options): Promise<number> {
 
   const pr = one(options, "pr");
   const { context, diff } = pr
-    ? pullRequestSource(pr, one(options, "repo"), toDiff, options.label ?? [])
+    ? pullRequestSource(
+        pr,
+        one(options, "repo"),
+        toDiff,
+        many(options, "label"),
+      )
     : localSource(options, toDiff);
 
   const plan = createPlan(config, context, diff);
@@ -1052,25 +1057,182 @@ async function verifyCommand(options: Options): Promise<number> {
   return failed.length === 0 ? 0 : 1;
 }
 
-const COMMANDS: Record<string, (options: Options) => Promise<number>> = {
-  create: createCommand,
-  execute: executeCommand,
-  verify: verifyCommand,
+/**
+ * A command, and everything `--help` says about it. Keeping the help next to
+ * the handler is what stops the two drifting apart: a new flag that goes
+ * undocumented is visible in the same object it was added to.
+ */
+export type Command = {
+  run: (options: Options) => Promise<number>;
+  /** One line, for the command list in the top-level help. */
+  summary: string;
+  /** What follows `test-plan.ts <name>` in the usage line. */
+  args: string;
+  /** A paragraph or two on what the command is for, wrapped at 76 columns. */
+  description: string[];
+  /** Every flag the command reads, with its default where it has one. */
+  flags: [flag: string, description: string][];
+  /** Worked invocations, the kind you would actually type. */
+  examples: string[];
 };
+
+export const COMMANDS: Record<string, Command> = {
+  create: {
+    run: createCommand,
+    summary: "work out which workflows and jobs should run",
+    args: "[--pr <n> | --event <e> --ref <r>] [options]",
+    description: [
+      "Resolves its inputs from a pull request (--pr, via gh) or from the",
+      "flags and the local git repository, so the same command run on a",
+      "laptop and in CI produces the same plan. Prints the plan, and writes",
+      "it to the `plan` job output when GITHUB_OUTPUT is set.",
+    ],
+    flags: [
+      ["--pr <n>", "plan pull request <n>: its branch, draft state and labels"],
+      ["--repo <owner/name>", "repository --pr belongs to (default: current)"],
+      ["--event <name>", "event to plan for, without --pr (default: push)"],
+      ["--ref <name>", "branch under test (default: the branch at --head)"],
+      [
+        "--base <ref>",
+        "what to diff against (default: the commit before --head)",
+      ],
+      ["--head <ref>", "what to diff (default: HEAD)"],
+      ["--base-ref <name>", "branch being merged into, recorded in the plan"],
+      ["--label <name>", "add a label to the context; repeatable"],
+      ["--config <path>", "plan config (default: .github/test-plan.yaml)"],
+      ["--filters <path>", "path groups (default: .github/paths-filter.yaml)"],
+      ["--out <path>", "also write the plan JSON to <path>"],
+      ["--format json|text", "how to print the plan (default: text)"],
+    ],
+    examples: [
+      "test-plan.ts create --pr 9",
+      "test-plan.ts create --pr 9 --label force-run",
+      "test-plan.ts create --event push --ref main --format json",
+      "test-plan.ts create --base origin/main --head HEAD --out plan.json",
+    ],
+  },
+  execute: {
+    run: executeCommand,
+    summary: "ask the plan whether one workflow or job runs",
+    args: "--plan <path|-> --workflow <w> [--job <j>]",
+    description: [
+      "Prints `true` or `false` on stdout and the reason on stderr, and",
+      "writes the answer to the `run` job output when GITHUB_OUTPUT is set.",
+      "Without --job it answers for the workflow as a whole.",
+    ],
+    flags: [
+      ["--plan <path|->", "the plan, as a file or `-` for stdin"],
+      ["--workflow <name>", "the workflow to ask about"],
+      ["--job <name>", "a job inside it (default: the workflow itself)"],
+    ],
+    examples: [
+      "test-plan.ts execute --plan plan.json --workflow ci",
+      "test-plan.ts execute --plan - --workflow lint --job lint",
+    ],
+  },
+  verify: {
+    run: verifyCommand,
+    summary: "check a finished run did what the plan asked for",
+    args: "--plan <path|-> --workflow <w> (--results <json> | --results-file <path|->)",
+    description: [
+      "The required check. Takes the plan and the `needs` context and",
+      "confirms every job the plan asked for ran and passed, and every job",
+      "it ruled out was skipped. Exits non-zero when they disagree.",
+    ],
+    flags: [
+      ["--plan <path|->", "the plan, as a file or `-` for stdin"],
+      ["--workflow <name>", "the workflow whose jobs to check"],
+      ["--results <json>", "the `needs` context, as JSON"],
+      ["--results-file <path|->", "the same, read from a file or stdin"],
+      ["--config <path>", "plan config (default: .github/test-plan.yaml)"],
+    ],
+    examples: [
+      'test-plan.ts verify --plan plan.json --workflow ci --results "$RESULTS"',
+      "printf '%s' \"$PLAN\" | test-plan.ts verify --plan - --workflow ci \\",
+      "  --results-file results.json",
+    ],
+  },
+};
+
+/** The command list, for `--help` with no command given. */
+function overviewHelp(): string {
+  const width = Math.max(...Object.keys(COMMANDS).map((name) => name.length));
+
+  return [
+    "test-plan.ts — build and read the CI test plan.",
+    "",
+    "usage: test-plan.ts <command> [options]",
+    "",
+    "commands:",
+    ...Object.entries(COMMANDS).map(
+      ([name, command]) => `  ${name.padEnd(width)}  ${command.summary}`,
+    ),
+    "",
+    "Run `test-plan.ts <command> --help` for a command's options.",
+  ].join("\n");
+}
+
+/** Everything about one command, for `<command> --help`. */
+function commandHelp(name: string): string {
+  const command = COMMANDS[name] as Command;
+  const width = Math.max(...command.flags.map(([flag]) => flag.length));
+
+  return [
+    `test-plan.ts ${name} — ${command.summary}.`,
+    "",
+    `usage: test-plan.ts ${name} ${command.args}`,
+    "",
+    ...command.description,
+    "",
+    "options:",
+    ...command.flags.map(
+      ([flag, description]) => `  ${flag.padEnd(width)}  ${description}`,
+    ),
+    "",
+    "examples:",
+    ...command.examples.map((example) => `  ${example}`),
+  ].join("\n");
+}
+
+/** `--help` and `-h` take no value, so they never reach parseArgs. */
+function wantsHelp(argv: string[]): boolean {
+  return argv.includes("--help") || argv.includes("-h");
+}
 
 async function main(): Promise<number> {
   const [command, ...rest] = Bun.argv.slice(2);
 
-  if (command === undefined || !(command in COMMANDS)) {
-    console.error(
-      `usage: test-plan.ts <${Object.keys(COMMANDS).join("|")}> [options]`,
-    );
+  // `help`, `help <command>`, `--help`, `-h` — all the spellings people try.
+  if (command === "help" || command === undefined || wantsHelp([command])) {
+    const topic = command === "help" ? rest[0] : undefined;
+
+    if (topic !== undefined && !(topic in COMMANDS)) {
+      console.error(`unknown command "${topic}"\n\n${overviewHelp()}`);
+      return 2;
+    }
+
+    // No arguments at all is a misuse rather than a question, so the help
+    // goes to stderr and the exit code says something was wrong.
+    if (command === undefined) {
+      console.error(overviewHelp());
+      return 2;
+    }
+
+    console.log(topic === undefined ? overviewHelp() : commandHelp(topic));
+    return 0;
+  }
+
+  if (!(command in COMMANDS)) {
+    console.error(`unknown command "${command}"\n\n${overviewHelp()}`);
     return 2;
   }
 
-  return await (COMMANDS[command] as (o: Options) => Promise<number>)(
-    parseArgs(rest),
-  );
+  if (wantsHelp(rest)) {
+    console.log(commandHelp(command));
+    return 0;
+  }
+
+  return await (COMMANDS[command] as Command).run(parseArgs(rest));
 }
 
 if (import.meta.main) {
