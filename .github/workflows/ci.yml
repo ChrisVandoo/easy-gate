@@ -31,7 +31,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           BEFORE: ${{ github.event.before }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [ -n "$PR" ]; then
             bun .github/scripts/test-plan.ts create --pr "$PR" --repo "$GITHUB_REPOSITORY"
@@ -39,8 +38,7 @@ jobs:
             bun .github/scripts/test-plan.ts create \
               --event "$GITHUB_EVENT_NAME" \
               --ref "$GITHUB_REF_NAME" \
-              --base "$BEFORE" \
-              --default-branch "$DEFAULT_BRANCH"
+              --base "$BEFORE"
           fi
 
   lint:

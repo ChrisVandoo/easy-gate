@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { parseFilters } from "./paths-filter.ts";
 import {
   createPlan,
+  DIFF_FAILED,
   lookupJob,
   matchesPredicate,
   type PlanContext,
@@ -23,16 +24,11 @@ overrides:
       labels: [force-run]
     decision: run
     reason: force-run label is set
-  - id: first-commit
+  - id: protected-branch
     when:
-      firstCommit: true
+      branch: [main, "release/**"]
     decision: run
-    reason: nothing to diff against, so everything runs
-  - id: default-branch
-    when:
-      defaultBranch: true
-    decision: run
-    reason: pushes to the default branch always run everything
+    reason: pushes to a protected branch always run everything
 
 workflows:
   ci:
@@ -43,6 +39,9 @@ workflows:
         paths: [src, workflows]
       test:
         paths: [src]
+        when:
+          - labels: [deep-test]
+          - branch: ["release/**"]
       required:
         gate: true
 `);
@@ -52,8 +51,6 @@ function context(overrides: Partial<PlanContext> = {}): PlanContext {
     event: "pull_request",
     ref: "feature",
     baseRef: "main",
-    defaultBranch: false,
-    firstCommit: false,
     draft: false,
     labels: [],
     ...overrides,
@@ -63,16 +60,21 @@ function context(overrides: Partial<PlanContext> = {}): PlanContext {
 /** Builds a plan, and notes whether working the diff out was ever needed. */
 function build(
   overrides: Partial<PlanContext> = {},
-  changedGroups: string[] = [],
+  /** The groups the diff reports, or the error it fails with. */
+  changed: string[] | Error = [],
 ) {
   let askedForDiff = false;
 
   const plan = createPlan(config, context(overrides), () => {
     askedForDiff = true;
 
+    if (changed instanceof Error) {
+      throw changed;
+    }
+
     return {
-      changedFiles: changedGroups.map((group) => `${group}/file.ts`),
-      changedGroups,
+      changedFiles: changed.map((group) => `${group}/file.ts`),
+      changedGroups: changed,
     };
   });
 
@@ -93,17 +95,25 @@ describe("parseConfig", () => {
     expect(config.overrides.map((override) => override.id)).toEqual([
       "skip-all",
       "force-run",
-      "first-commit",
-      "default-branch",
+      "protected-branch",
     ]);
   });
 
   test("reads job options", () => {
     expect(config.workflows.ci?.test).toEqual({
       paths: ["src"],
+      when: [{ labels: ["deep-test"] }, { branch: ["release/**"] }],
       exempt: false,
       gate: false,
     });
+  });
+
+  test("rejects a job `when` that is not a list", () => {
+    expect(() =>
+      parseConfig(
+        "workflows:\n  ci:\n    jobs:\n      test:\n        when:\n          labels: [x]",
+      ),
+    ).toThrow(/must be a list of `when` mappings/);
   });
 
   test("rejects an override without a decision", () => {
@@ -122,6 +132,39 @@ describe("matchesPredicate", () => {
     expect(
       matchesPredicate({ labels: ["a", "b"] }, context({ labels: ["b"] })),
     ).toBe(true);
+  });
+
+  test("matches a branch by name", () => {
+    const when = { branch: ["main"] };
+
+    expect(matchesPredicate(when, context({ ref: "main" }))).toBe(true);
+    expect(matchesPredicate(when, context({ ref: "mainly" }))).toBe(false);
+  });
+
+  test("matches a branch by glob", () => {
+    const when = { branch: ["release/*", "renovate/**"] };
+
+    expect(matchesPredicate(when, context({ ref: "release/1.2" }))).toBe(true);
+    // `*` stops at a slash, `**` does not.
+    expect(matchesPredicate(when, context({ ref: "release/1.2/fix" }))).toBe(
+      false,
+    );
+    expect(matchesPredicate(when, context({ ref: "renovate/a/b" }))).toBe(true);
+    expect(matchesPredicate(when, context({ ref: "feature" }))).toBe(false);
+  });
+
+  test("matches a label by glob", () => {
+    expect(
+      matchesPredicate({ labels: ["ci/*"] }, context({ labels: ["ci/skip"] })),
+    ).toBe(true);
+  });
+
+  test("matches a pull request on its head branch, not its base", () => {
+    // A pull request into main is still a pull request, so the branch
+    // override must not fire on it.
+    expect(
+      matchesPredicate({ branch: ["main"] }, context({ baseRef: "main" })),
+    ).toBe(false);
   });
 
   test("ands its predicates together", () => {
@@ -168,14 +211,10 @@ describe("createPlan", () => {
     });
   });
 
-  test("runs everything on the default branch", () => {
-    const { plan, askedForDiff } = build({
-      event: "push",
-      ref: "main",
-      defaultBranch: true,
-    });
+  test("runs everything on a protected branch", () => {
+    const { plan, askedForDiff } = build({ event: "push", ref: "main" });
 
-    expect(plan.override).toBe("default-branch");
+    expect(plan.override).toBe("protected-branch");
     // The override settles every job, so there is nothing for a diff to tell
     // us — and on the default branch that diff is the most expensive one.
     expect(askedForDiff).toBe(false);
@@ -188,13 +227,17 @@ describe("createPlan", () => {
     });
   });
 
-  test("runs everything when there is no base to diff against", () => {
-    // A new branch, or a root commit: the diff is empty because there is
-    // nothing to compare to, not because nothing changed.
-    const { plan, askedForDiff } = build({ event: "push", firstCommit: true });
+  test("runs everything when the diff cannot be worked out", () => {
+    // A new branch, a force-pushed base, a clone too shallow to reach it: the
+    // diff is unavailable, which is not the same as empty. Skipping jobs here
+    // would be skipping them on no evidence.
+    const { plan, askedForDiff } = build(
+      { event: "push" },
+      new Error("fatal: bad object 0000000"),
+    );
 
-    expect(plan.override).toBe("first-commit");
-    expect(askedForDiff).toBe(false);
+    expect(plan.override).toBe(DIFF_FAILED);
+    expect(askedForDiff).toBe(true);
     expect(jobs(plan)).toEqual({
       plan: true,
       lint: true,
@@ -203,10 +246,22 @@ describe("createPlan", () => {
     });
   });
 
-  test("skip-all still wins on a first commit", () => {
-    expect(
-      build({ firstCommit: true, labels: ["skip-all"] }).plan.override,
-    ).toBe("skip-all");
+  test("records that the diff was unavailable", () => {
+    const { plan } = build({}, new Error("fatal: bad object 0000000"));
+
+    expect(plan.inputs.changedGroups).toBeNull();
+    expect(plan.workflows.ci?.jobs.test?.reason).toMatch(/everything runs/);
+  });
+
+  test("an override settles it before the diff gets a chance to fail", () => {
+    const { plan, askedForDiff } = build(
+      { labels: ["skip-all"] },
+      new Error("fatal: bad object 0000000"),
+    );
+
+    expect(plan.override).toBe("skip-all");
+    expect(askedForDiff).toBe(false);
+    expect(jobs(plan).test).toBe(false);
   });
 
   test("force-run beats an empty diff", () => {
@@ -231,6 +286,53 @@ describe("createPlan", () => {
     const { plan } = build({ labels: ["force-run", "skip-all"] });
 
     expect(plan.override).toBe("skip-all");
+  });
+
+  test("a job runs when its own `when` matches, whatever the diff says", () => {
+    const { plan } = build({ labels: ["deep-test"] });
+
+    expect(jobs(plan).test).toBe(true);
+    expect(lookupJob(plan, "ci", "test").reason).toBe(
+      "asked for by labels: deep-test",
+    );
+    // Only the job that asked for it — this is not another blanket override.
+    expect(jobs(plan).lint).toBe(false);
+  });
+
+  test("a job's `when` is an or, so any one entry is enough", () => {
+    expect(jobs(build({ ref: "release/1.2", labels: [] }).plan).test).toBe(
+      true,
+    );
+    expect(jobs(build({ ref: "feature" }).plan).test).toBe(false);
+  });
+
+  test("asking for a job by label outranks skip-all", () => {
+    const { plan } = build({ labels: ["skip-all", "deep-test"] });
+
+    expect(plan.override).toBe("skip-all");
+    expect(jobs(plan)).toEqual({
+      plan: true,
+      lint: false,
+      test: true,
+      required: true,
+    });
+  });
+
+  test("a `when` that does not match leaves the path filter alone", () => {
+    expect(jobs(build({ labels: ["unrelated"] }, ["src"]).plan).test).toBe(
+      true,
+    );
+    expect(
+      jobs(build({ labels: ["unrelated"] }, ["workflows"]).plan).test,
+    ).toBe(false);
+  });
+
+  test("a job's `when` still does not make the diff worth working out", () => {
+    // The diff decides the other jobs, so it is still asked for — the point is
+    // that a label does not stand in for it.
+    const { askedForDiff } = build({ labels: ["deep-test"] });
+
+    expect(askedForDiff).toBe(true);
   });
 
   test("a workflow runs when any of its real jobs run", () => {

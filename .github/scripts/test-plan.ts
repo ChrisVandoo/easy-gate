@@ -10,7 +10,7 @@
  *
  * Usage:
  *   test-plan.ts create  [--pr <n>] [--event <e>] [--ref <r>] [--label <l>]...
- *                        [--base <ref>] [--head <ref>] [--default-branch <b>]
+ *                        [--base <ref>] [--head <ref>]
  *                        [--repo <owner/name>] [--config <p>] [--filters <p>]
  *                        [--out <path>] [--format json|text]
  *   test-plan.ts execute --plan <path|-> --workflow <w> [--job <j>]
@@ -26,15 +26,11 @@
 import {
   changedFiles,
   defaultBase,
-  EMPTY_TREE,
   matchGroups,
   parseFilters,
 } from "./paths-filter.ts";
 
 export const PLAN_VERSION = 1;
-
-/** What a push event reports as `before` when it creates the branch. */
-const NULL_SHA = "0".repeat(40);
 
 /**
  * Everything known without looking at the diff. Overrides decide from this
@@ -45,9 +41,6 @@ export type PlanContext = {
   event: string;
   ref: string;
   baseRef: string | null;
-  defaultBranch: boolean;
-  /** There is no base to diff against — a new branch, or a root commit. */
-  firstCommit: boolean;
   draft: boolean;
   labels: string[];
 };
@@ -58,7 +51,12 @@ export type PlanDiff = {
   changedGroups: string[];
 };
 
-/** What the plan records: the context, and the diff if one was needed. */
+/**
+ * What the plan records: the context, and the diff if one was needed. Both
+ * lists are null when there is no diff, either because an override settled
+ * everything without one or because working it out failed; `override` says
+ * which.
+ */
 export type PlanInputs = PlanContext & {
   changedFiles: string[] | null;
   changedGroups: string[] | null;
@@ -86,6 +84,13 @@ export type Override = {
 
 export type JobConfig = {
   paths?: string[];
+  /**
+   * Conditions that make this job run whatever the diff says. Any one of them
+   * matching is enough — unlike an override's `when`, which is an AND of its
+   * predicates, a list of them is an OR, because each entry is another reason
+   * this particular job is wanted.
+   */
+  when?: Predicate[];
   exempt?: boolean;
   gate?: boolean;
 };
@@ -111,12 +116,26 @@ export const PREDICATES: Record<
   (value: unknown, context: PlanContext) => boolean
 > = {
   labels: (value, context) =>
-    stringList(value, "labels").some((label) => context.labels.includes(label)),
+    matchesAny(stringList(value, "labels"), context.labels),
+  branch: (value, context) =>
+    matchesAny(stringList(value, "branch"), [context.ref]),
   event: (value, context) => stringList(value, "event").includes(context.event),
-  defaultBranch: (value, context) => value === context.defaultBranch,
-  firstCommit: (value, context) => value === context.firstCommit,
   draft: (value, context) => value === context.draft,
 };
+
+/**
+ * True when any pattern matches any value. Patterns are globs, so a plain name
+ * with no wildcard in it is simply an exact match — which is what lets one
+ * list hold `main`, `release/*` and `renovate/**` side by side. As usual `*`
+ * stops at a `/` and `**` does not.
+ */
+function matchesAny(patterns: string[], values: string[]): boolean {
+  return patterns.some((pattern) => {
+    const glob = new Bun.Glob(pattern);
+
+    return values.some((value) => glob.match(value));
+  });
+}
 
 function stringList(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
@@ -156,6 +175,22 @@ export function matchesPredicate(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A job's `when` is a list of predicates, not the single mapping an override
+ * takes, so the common case — one label — still reads as one line of YAML.
+ */
+function parseJobWhen(value: unknown, job: string): Predicate[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value) || !value.every(isRecord)) {
+    throw new Error(`job "${job}".when must be a list of \`when\` mappings`);
+  }
+
+  return value as Predicate[];
 }
 
 export function parseConfig(source: string): PlanConfig {
@@ -221,6 +256,7 @@ export function parseConfig(source: string): PlanConfig {
 
       jobs[job] = {
         paths: options.paths as string[] | undefined,
+        when: parseJobWhen(options.when, `${workflow}/${job}`),
         exempt: options.exempt === true,
         gate: options.gate === true,
       };
@@ -262,8 +298,16 @@ export function selectOverride(
   );
 }
 
+/** `labels: [a, b], branch: [main]` — an override's `when` as one line. */
+function describePredicate(predicate: Predicate): string {
+  return Object.entries(predicate)
+    .map(([name, value]) => `${name}: ${[value].flat().join(", ")}`)
+    .join(" and ");
+}
+
 export function planJob(
   options: JobConfig,
+  context: PlanContext,
   override: Override | null,
   changedGroups: string[],
 ): JobPlan {
@@ -273,6 +317,18 @@ export function planJob(
 
   if (options.exempt) {
     return { run: true, reason: "exempt from filters, always runs" };
+  }
+
+  // A job's own `when` is a conditional `exempt`, and sits where `exempt` does:
+  // asking for a job by label is asking for it to run, so it outranks a blanket
+  // skip in the same way. Nothing here can turn a job off — a `when` that does
+  // not match just leaves the path filter to decide as it would have.
+  const wanted = options.when?.find((predicate) =>
+    matchesPredicate(predicate, context),
+  );
+
+  if (wanted) {
+    return { run: true, reason: `asked for by ${describePredicate(wanted)}` };
   }
 
   if (override) {
@@ -290,25 +346,61 @@ export function planJob(
     : { run: false, reason: `no changes in ${options.paths.join(", ")}` };
 }
 
+/** The id the plan carries when everything ran because the diff failed. */
+export const DIFF_FAILED = "diff-failed";
+
 /**
- * `diff` is a thunk because an override settles every job on its own: on the
- * default branch, behind force-run or skip-all, or on a first commit there is
- * no question left for the diff to answer, so it is never asked.
+ * The blanket decision taken when we cannot tell what changed.
+ *
+ * Nothing in the config can express this, because it is not a property of the
+ * inputs: it is what is left when git or the API will not answer. A push that
+ * creates a branch (whose `before` is all zeroes), a force-push that left the
+ * base pointing at a commit nobody has any more, a clone too shallow to reach
+ * it — all of them land here and all of them mean the same thing. Running
+ * everything is the only honest answer, since the alternative is skipping jobs
+ * on no evidence at all.
+ */
+const diffFailed: Override = {
+  id: DIFF_FAILED,
+  when: {},
+  decision: "run",
+  reason: "could not work out what changed, so everything runs",
+};
+
+/**
+ * `diff` is a thunk because an override settles every job on its own: on a
+ * protected branch, or behind force-run or skip-all, there is no question left
+ * for the diff to answer, so it is never asked. When it is asked and throws,
+ * that is not an error to fail the run with — it is the diff-failed decision.
  */
 export function createPlan(
   config: PlanConfig,
   context: PlanContext,
   diff: () => PlanDiff,
 ): TestPlan {
-  const override = selectOverride(config, context);
-  const changes = override ? null : diff();
+  let override = selectOverride(config, context);
+  let changes: PlanDiff | null = null;
+
+  if (!override) {
+    try {
+      changes = diff();
+    } catch {
+      override = diffFailed;
+    }
+  }
+
   const workflows: Record<string, WorkflowPlan> = {};
 
   for (const [workflow, jobConfigs] of Object.entries(config.workflows)) {
     const jobs: Record<string, JobPlan> = {};
 
     for (const [job, options] of Object.entries(jobConfigs)) {
-      jobs[job] = planJob(options, override, changes?.changedGroups ?? []);
+      jobs[job] = planJob(
+        options,
+        context,
+        override,
+        changes?.changedGroups ?? [],
+      );
     }
 
     // A workflow is worth running when it has real work in it — a gate or an
@@ -519,13 +611,10 @@ function pullRequestSource(
   return {
     context: {
       event: "pull_request",
+      // The branch under test, which `branch` predicates match against — for
+      // a pull request that is the head, not the branch it will merge into.
       ref: view.headRefName,
       baseRef: view.baseRefName,
-      // A pull request never targets its own head, so it is never the default
-      // branch — that case is a push, handled below.
-      defaultBranch: false,
-      // A pull request always has a base branch to diff against.
-      firstCommit: false,
       draft: view.isDraft,
       // The API is the source of truth, so a re-run picks up a label added
       // since the run started. --label adds to that, which is how you ask
@@ -549,13 +638,11 @@ function localSource(
   toDiff: (files: string[]) => PlanDiff,
 ): Source {
   const head = one(options, "head") ?? "HEAD";
-  // A push that creates a branch reports an all-zero `before` commit, and a
-  // root commit has no parent. Both mean the same thing: nothing to diff
-  // against. Treat an empty --base as absent too, since that is what a
-  // workflow passes for an event that has no `before` at all.
-  const requested = one(options, "base") || undefined;
-  const base =
-    requested === NULL_SHA ? EMPTY_TREE : (requested ?? defaultBase(head));
+  // An empty --base is treated as absent, since that is what a workflow passes
+  // for an event with no `before` at all. A base that is present but useless —
+  // the all-zero commit a branch-creating push reports, say — is left alone on
+  // purpose: the diff against it fails, and everything runs.
+  const base = one(options, "base") || defaultBase(head);
   const ref =
     one(options, "ref") ??
     run(["git", "rev-parse", "--abbrev-ref", head]).trim();
@@ -565,8 +652,6 @@ function localSource(
       event: one(options, "event") ?? "push",
       ref,
       baseRef: one(options, "base-ref") ?? null,
-      defaultBranch: ref === (one(options, "default-branch") ?? "main"),
-      firstCommit: base === EMPTY_TREE,
       draft: false,
       labels: options.label ?? [],
     },
@@ -664,6 +749,17 @@ async function appendSummary(markdown: string): Promise<void> {
   await Bun.write(path, (await Bun.file(path).text()) + markdown);
 }
 
+/** What the diff said, or why the plan has none to show. */
+function describeChanges(plan: TestPlan): string {
+  const { changedFiles, changedGroups } = plan.inputs;
+
+  if (changedGroups === null) {
+    return `(no diff — ${plan.override} decides)`;
+  }
+
+  return `${changedGroups.join(", ") || "(no matching groups)"} (${changedFiles?.length ?? 0} file(s))`;
+}
+
 function describePlan(plan: TestPlan): string {
   const lines: string[] = [];
   const { inputs } = plan;
@@ -673,11 +769,7 @@ function describePlan(plan: TestPlan): string {
     `ref:      ${inputs.ref}${inputs.baseRef ? ` -> ${inputs.baseRef}` : ""}`,
   );
   lines.push(`labels:   ${inputs.labels.join(", ") || "(none)"}`);
-  lines.push(
-    inputs.changedGroups === null
-      ? `changed:  (not looked at — ${plan.override} decides)`
-      : `changed:  ${inputs.changedGroups.join(", ") || "(no matching groups)"} (${inputs.changedFiles?.length ?? 0} file(s))`,
-  );
+  lines.push(`changed:  ${describeChanges(plan)}`);
   lines.push(`override: ${plan.override ?? "(none)"}`);
   lines.push("");
 

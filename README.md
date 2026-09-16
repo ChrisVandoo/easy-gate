@@ -70,15 +70,60 @@ workflows:
     jobs:
       test:
         paths: [src]     # runs when the `src` group changed
+        when:
+          - labels: [deep-test]   # ...and whenever this label is on the PR
       required:
         gate: true       # always runs, and does the verifying
 ```
 
 A job with no `paths` is unconditional; `exempt: true` opts it out of overrides
 and filters entirely. An override's `when` is an AND of predicates — `labels`,
-`event`, `defaultBranch`, `firstCommit`, `draft` today. Adding a new input means adding one
+`branch`, `event`, `draft` today. Adding a new input means adding one
 entry to `PREDICATES` in [`.github/scripts/test-plan.ts`](.github/scripts/test-plan.ts)
 and one field to `PlanInputs`; nothing else in the pipeline changes.
+
+A job takes a `when` of its own, and that one is a list: the same predicates,
+but any entry matching is enough, because each is another reason to want this
+particular job. It is a conditional `exempt` — asking for a job is asking for it
+to run, so a job asked for here runs even under `skip-all`. It cannot turn a job
+off: an entry that does not match simply leaves the path filter to decide.
+
+```
+RUN  ci
+  RUN  plan         exempt from filters, always runs
+  SKIP lint         no changes in src, workflows
+  RUN  test         asked for by labels: deep-test
+  RUN  required     gate job, always runs
+```
+
+`labels` and `branch` match on globs, so each entry is either a plain name,
+which has to match exactly, or a pattern — `*` stopping at a `/` and `**` not:
+
+```yaml
+overrides:
+  - id: protected-branch
+    when:
+      branch: [main, "release/**"]   # which branches these are is config,
+    decision: run                    # not something CI passes in
+    reason: pushes to a protected branch always run everything
+```
+
+`branch` matches the branch the commits are on, which for a pull request is its
+head branch, not the branch it will merge into — so a branch override fires on
+a push to `main` and not on a pull request into `main`.
+
+A diff that cannot be worked out is not an override, because it is not a
+property of the inputs: `create` tries the diff, and if git or the API will not
+answer — a branch that has just been created, a force-pushed base, a clone too
+shallow to reach it — the plan runs everything and says so.
+
+```
+changed:  (no diff — diff-failed decides)
+override: diff-failed
+```
+
+The alternative would be reading an unavailable diff as an empty one and
+skipping every job on no evidence.
 
 Two mistakes are caught by `bun test` rather than by a failing run: filtering on
 a path group that does not exist, and a job in the config that does not match
@@ -105,8 +150,8 @@ bun run plan execute --plan plan.json --workflow ci --job test   # -> true | fal
 bun run plan verify --plan plan.json --workflow ci --results "$NEEDS"
 ```
 
-`create` takes `--pr` (via `gh`) or `--event` / `--ref` / `--base` / `--head` /
-`--default-branch`, and writes the plan to `--out` and to `GITHUB_OUTPUT`.
+`create` takes `--pr` (via `gh`) or `--event` / `--ref` / `--base` / `--head`,
+and writes the plan to `--out` and to `GITHUB_OUTPUT`.
 `--label` works with both: on a pull request it adds to the labels the API
 reports, so you can try a label out without setting it. `execute` prints `true` or `false` with the reason on stderr.
 `verify` exits non-zero when a planned job did not succeed, when a job the plan

@@ -11,11 +11,16 @@
 # `when` is an AND of predicates. The available predicates are defined by
 # PREDICATES in .github/scripts/test-plan.ts; adding a new input means adding
 # one entry there and using it here. Today:
-#   labels:        <list>  — true when the PR carries any of these labels
-#   event:         <list>  — true when the triggering event is one of these
-#   defaultBranch: <bool>  — true when the ref is the repo's default branch
-#   firstCommit:   <bool>  — true when there is no base commit to diff against
-#   draft:         <bool>  — true when the PR is a draft
+#   labels: <list>  — true when the PR carries any of these labels
+#   branch: <list>  — true when the branch under test is one of these
+#   event:  <list>  — true when the triggering event is one of these
+#   draft:  <bool>  — true when the PR is a draft
+#
+# `labels` and `branch` take globs, so an entry is either a plain name, which
+# matches exactly, or a pattern: `release/*` matches `release/1.2` but not
+# `release/1.2/hotfix`, and `release/**` matches both. The branch under test is
+# the one the commits are on — for a pull request that is the head branch, not
+# the branch it will merge into.
 overrides:
   - id: skip-all
     when:
@@ -29,17 +34,16 @@ overrides:
     decision: run
     reason: force-run label is set
 
-  - id: first-commit
+  - id: protected-branch
     when:
-      firstCommit: true
+      branch: [main, "release/**"]
     decision: run
-    reason: nothing to diff against, so everything runs
+    reason: pushes to a protected branch always run everything
 
-  - id: default-branch
-    when:
-      defaultBranch: true
-    decision: run
-    reason: pushes to the default branch always run everything
+# Nothing here covers a diff that cannot be worked out — a brand new branch, a
+# force-pushed base, a clone too shallow to reach it. That is not a property of
+# the inputs, so it is not an override: `create` tries the diff, and if it
+# fails the plan runs everything and records why.
 
 # Every workflow the plan governs, and the jobs inside it.
 #
@@ -47,9 +51,17 @@ overrides:
 # .github/paths-filter.yaml, and an unknown group is an error. A job with no
 # `paths` is unconditional. A workflow runs when any of its jobs run.
 #
-#   exempt: true  — always runs, ignoring overrides and path filters
-#   gate:   true  — implies exempt, and excludes the job from verification
-#                   (this is the job that does the verifying)
+#   when:   <list>  — run this job whatever the diff says, whenever any entry
+#                     matches. Each entry is a `when` mapping exactly as an
+#                     override takes one, so the same predicates are available;
+#                     the list is an OR, since each entry is another reason to
+#                     want this job. Asking for a job — by label, usually —
+#                     outranks a blanket skip, so a job asked for here runs
+#                     even under skip-all. It can only turn a job on: an entry
+#                     that does not match leaves the path filter to decide.
+#   exempt: true    — always runs, ignoring overrides and path filters
+#   gate:   true    — implies exempt, and excludes the job from verification
+#                     (this is the job that does the verifying)
 workflows:
   ci:
     jobs:
@@ -59,6 +71,8 @@ workflows:
         paths: [src, workflows]
       test:
         paths: [src]
+        when:
+          - labels: [deep-test]
       required:
         gate: true
 
@@ -68,3 +82,5 @@ workflows:
         exempt: true
       debug:
         paths: [workflows]
+        when:
+          - labels: [debug]
