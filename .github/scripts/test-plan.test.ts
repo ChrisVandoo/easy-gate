@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { parseFilters } from "./paths-filter.ts";
 import {
+  COMMANDS,
   createPlan,
   DIFF_FAILED,
   lookupJob,
   matchesPredicate,
   type PlanContext,
+  parseArgs,
   parseConfig,
   parsePlan,
   serializePlan,
@@ -710,5 +712,48 @@ describe("the checked-in config", () => {
         changedGroups: [],
       })),
     ).not.toThrow();
+  });
+});
+
+const cliSource = await Bun.file(".github/scripts/test-plan.ts").text();
+
+// The help is only worth having if it is true, and it stops being true the
+// moment someone reads a flag the help does not mention.
+describe("the CLI help", () => {
+  const documented = new Set(
+    Object.values(COMMANDS).flatMap((command) =>
+      command.flags.map(([flag]) => flag.split(" ")[0]?.slice(2)),
+    ),
+  );
+
+  test("every flag the script reads is documented", () => {
+    const read = [
+      ...cliSource.matchAll(/(?:one|required|many)\(options, "([a-z-]+)"\)/g),
+    ].map((match) => match[1] as string);
+
+    expect([...new Set(read)].filter((flag) => !documented.has(flag))).toEqual(
+      [],
+    );
+  });
+
+  test.each(Object.keys(COMMANDS))("%s's examples parse", (name) => {
+    for (const example of COMMANDS[name]?.examples ?? []) {
+      // Only the lines that are a whole invocation; a continued line is
+      // checked as part of the one it continues.
+      if (!example.startsWith(`test-plan.ts ${name}`)) {
+        continue;
+      }
+
+      const argv = example
+        .replace(`test-plan.ts ${name} `, "")
+        .replaceAll("\\", "")
+        .split(/\s+/)
+        .filter((word) => word.length > 0);
+
+      expect(() => parseArgs(argv)).not.toThrow();
+      expect(
+        Object.keys(parseArgs(argv)).filter((flag) => !documented.has(flag)),
+      ).toEqual([]);
+    }
   });
 });

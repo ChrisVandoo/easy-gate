@@ -207,7 +207,14 @@ bun run plan execute --plan plan.json --workflow ci --job test   # -> true | fal
 
 # Did the run do what the plan said? (this is the required check)
 bun run plan verify --plan plan.json --workflow ci --results "$NEEDS"
+
+# Every command and flag, from the tool itself
+bun run plan --help
+bun run plan create --help
 ```
+
+The help is checked: a test fails if the script reads a flag the help does not
+mention, so `--help` is the list to trust rather than this one.
 
 `create` takes `--pr` (via `gh`) or `--event` / `--ref` / `--base` / `--head`,
 and writes the plan to `--out` and to `GITHUB_OUTPUT`.
