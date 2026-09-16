@@ -25,7 +25,7 @@ import {
   parseFilters,
 } from "./paths-filter.ts";
 
-export const PLAN_VERSION = 1;
+export const PLAN_VERSION = 2;
 
 /**
  * Everything known without looking at the diff. Overrides decide from this
@@ -45,6 +45,9 @@ export type PlanDiff = {
   changedFiles: string[];
   changedGroups: string[];
 };
+
+/** The context plus the diff: everything a condition is tested against. */
+export type Facts = PlanContext & { changedGroups: string[] };
 
 /**
  * What the plan records: the context, and the diff if one was needed. Both
@@ -68,16 +71,34 @@ export type TestPlan = {
   workflows: Record<string, WorkflowPlan>;
 };
 
-export type Predicate = Record<string, unknown>;
+/**
+ * A `run:` or `skip:` block: some conditions, and whether they are anded or
+ * ored together. `all` is the default, so the common case — a label and an
+ * event, both of which must hold — needs no `condition:` line.
+ */
+export type Condition = {
+  mode: "all" | "any";
+  /** Predicate name to its parsed value, in the order the YAML listed them. */
+  predicates: Record<string, unknown>;
+};
 
-export type Override = {
+/**
+ * The blocks a job may carry, whatever else it has on it. `LADDER` is what
+ * settles them against each other.
+ */
+export type Blocks = {
+  "force-skip"?: Condition | null;
+  run?: Condition | null;
+  skip?: Condition | null;
+};
+
+/** An override gets the two blocks that are not workflow level settings. */
+export type Override = Pick<Blocks, "run" | "skip"> & {
   id: string;
-  when: Predicate;
-  decision: "run" | "skip";
   reason: string;
 };
 
-export type JobConfig = {
+export type JobConfig = Blocks & {
   /**
    * The workflow this job calls, for a job whose whole body is `uses:`. Such a
    * job decides nothing itself — it runs exactly when the workflow it calls has
@@ -85,16 +106,6 @@ export type JobConfig = {
    * other, are what settle it.
    */
   calls?: string;
-  paths?: string[];
-  /**
-   * Conditions that make this job run whatever the diff says. Any one of them
-   * matching is enough — unlike an override's `when`, which is an AND of its
-   * predicates, a list of them is an OR, because each entry is another reason
-   * this particular job is wanted.
-   */
-  when?: Predicate[];
-  exempt?: boolean;
-  gate?: boolean;
 };
 
 export type PlanConfig = {
@@ -106,24 +117,74 @@ export type PlanConfig = {
 // Predicates
 // ---------------------------------------------------------------------------
 
-/**
- * The predicates an override's `when` may use. A new input is a new entry here
- * plus a field on PlanContext — nothing else in the pipeline needs to change.
- *
- * They take the context rather than the whole plan inputs on purpose: a
- * predicate that could read the diff would defeat skipping it.
- */
-export const PREDICATES: Record<
-  string,
-  (value: unknown, context: PlanContext) => boolean
-> = {
-  labels: (value, context) =>
-    matchesAny(stringList(value, "labels"), context.labels),
-  branch: (value, context) =>
-    matchesAny(stringList(value, "branch"), [context.ref]),
-  event: (value, context) => stringList(value, "event").includes(context.event),
-  draft: (value, context) => value === context.draft,
+type PredicateSpec = {
+  /** Checks what the YAML said and normalises it, once, at parse time. */
+  parse: (value: unknown, where: string) => unknown;
+  test: (value: unknown, facts: Facts) => boolean;
+  /**
+   * The value as it appears in a plan's reasons. `facts` is passed when the
+   * predicate matched, so a list can name the entries that did the matching
+   * rather than repeating the whole thing back.
+   */
+  describe: (value: unknown, facts?: Facts) => string;
+  /** True for a predicate that cannot be answered until the diff is known. */
+  needsDiff?: boolean;
 };
+
+/**
+ * The conditions a `run:` or `skip:` block may use. A new input is a new entry
+ * here plus a field on PlanContext — nothing else in the pipeline changes.
+ *
+ * Anything marked `needsDiff` is barred from an override, which is what keeps
+ * the "an override settles it without working the diff out" shortcut honest.
+ */
+export const PREDICATES: Record<string, PredicateSpec> = {
+  labels: {
+    parse: stringList,
+    test: (value, facts) => matchesAny(value as string[], facts.labels),
+    describe: list,
+  },
+  branch: {
+    parse: stringList,
+    test: (value, facts) => matchesAny(value as string[], [facts.ref]),
+    describe: list,
+  },
+  event: {
+    parse: stringList,
+    test: (value, facts) => (value as string[]).includes(facts.event),
+    describe: list,
+  },
+  draft: {
+    parse: (value, where) => {
+      if (typeof value !== "boolean") {
+        throw new Error(`${where} must be true or false`);
+      }
+
+      return value;
+    },
+    test: (value, facts) => value === facts.draft,
+    describe: String,
+  },
+  paths: {
+    parse: stringList,
+    test: (value, facts) => changedIn(value as string[], facts).length > 0,
+    // "changed: src" is the useful half of "one of src, workflows changed".
+    describe: (value, facts) => {
+      const hits = facts ? changedIn(value as string[], facts) : [];
+
+      return list(hits.length > 0 ? hits : value);
+    },
+    needsDiff: true,
+  },
+};
+
+function list(value: unknown): string {
+  return (value as string[]).join(", ");
+}
+
+function changedIn(groups: string[], facts: Facts): string[] {
+  return groups.filter((group) => facts.changedGroups.includes(group));
+}
 
 /**
  * True when any pattern matches any value. Patterns are globs, so a plain name
@@ -139,36 +200,155 @@ function matchesAny(patterns: string[], values: string[]): boolean {
   });
 }
 
-function stringList(value: unknown, field: string): string[] {
+function stringList(value: unknown, where: string): string[] {
   if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
-    throw new Error(`predicate "${field}" must be a list of strings`);
+    throw new Error(`${where} must be a list of strings`);
   }
 
   return value as string[];
 }
 
-/** An empty `when` matches nothing; otherwise every predicate must hold. */
-export function matchesPredicate(
-  predicate: Predicate,
-  context: PlanContext,
-): boolean {
-  const entries = Object.entries(predicate);
+// ---------------------------------------------------------------------------
+// Conditions
+// ---------------------------------------------------------------------------
 
-  if (entries.length === 0) {
-    return false;
+/** The predicates that hold — both the answer and the reason for it. */
+function matched(condition: Condition, facts: Facts): string[] {
+  return Object.entries(condition.predicates)
+    .filter(([name, value]) => predicate(name).test(value, facts))
+    .map(([name]) => name);
+}
+
+/** `all` needs every predicate, `any` needs one. An empty block is rejected. */
+function holds(condition: Condition, hits: string[]): boolean {
+  return condition.mode === "any"
+    ? hits.length > 0
+    : hits.length === Object.keys(condition.predicates).length;
+}
+
+export function matchesCondition(condition: Condition, facts: Facts): boolean {
+  return holds(condition, matched(condition, facts));
+}
+
+function predicate(name: string): PredicateSpec {
+  const spec = PREDICATES[name];
+
+  if (!spec) {
+    throw new Error(
+      `unknown condition "${name}", expected one of ${Object.keys(PREDICATES).join(", ")}`,
+    );
   }
 
-  return entries.every(([name, value]) => {
-    const test = PREDICATES[name];
+  return spec;
+}
 
-    if (!test) {
-      throw new Error(
-        `unknown predicate "${name}", expected one of ${Object.keys(PREDICATES).join(", ")}`,
-      );
+/** The whole block, joined the way it is read: `labels: a or paths: src`. */
+function describeCondition(condition: Condition): string {
+  return describe(condition, Object.keys(condition.predicates), condition.mode);
+}
+
+/** The predicates that matched. They all hold, so they read as an `and`. */
+function describeMatched(
+  condition: Condition,
+  hits: string[],
+  facts: Facts,
+): string {
+  return describe(condition, hits, "all", facts);
+}
+
+function describe(
+  condition: Condition,
+  names: string[],
+  mode: "all" | "any",
+  facts?: Facts,
+): string {
+  return names
+    .map(
+      (name) =>
+        `${name}: ${predicate(name).describe(condition.predicates[name], facts)}`,
+    )
+    .join(mode === "any" ? " or " : " and ");
+}
+
+/**
+ * Every block there is, strongest first. This list is the whole of the
+ * run/skip rulebook, and the order is the rule:
+ *
+ *   force-skip  an unconditional no. Nothing below it can talk it round, so
+ *               it is the way to hold a job back even when the diff, or a
+ *               label, is asking for it.
+ *   run         asking for something to run is a positive instruction, and it
+ *               outranks a plain skip.
+ *   skip        the weakest, since it only ever says "no reason to bother".
+ *
+ * This ladder settles a workflow's own jobs against each other, and nothing
+ * more: an override is decided first and outranks all of it. `override` marks
+ * the blocks an override may use — `force-skip` is a workflow level setting,
+ * and would be meaningless there anyway, since an override that wants to skip
+ * something already has `skip` and already wins.
+ */
+const LADDER = [
+  { block: "force-skip", run: false, override: false },
+  { block: "run", run: true, override: true },
+  { block: "skip", run: false, override: true },
+] as const;
+
+const OVERRIDE_BLOCKS = LADDER.filter((rung) => rung.override);
+
+type Verdict = {
+  run: boolean;
+  /** The block that settled it, named as the YAML names it. */
+  block: (typeof LADDER)[number]["block"];
+  condition: Condition;
+  hits: string[];
+};
+
+/**
+ * The strongest block whose conditions hold. Null when none of them did —
+ * which is not the same as "skip", since what that means depends on whether
+ * there was a `run:` block to fail to match in the first place.
+ */
+function weigh(blocks: Blocks, facts: Facts): Verdict | null {
+  for (const { block, run } of LADDER) {
+    const condition = blocks[block];
+
+    if (!condition) {
+      continue;
     }
 
-    return test(value, context);
+    const hits = matched(condition, facts);
+
+    if (holds(condition, hits)) {
+      return { run, block, condition, hits };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * The strongest block the verdict overruled, of those that would have decided
+ * differently. Worth naming in a reason: it is the half of the answer that
+ * surprises whoever went looking.
+ */
+function overruled(
+  blocks: Blocks,
+  verdict: Verdict,
+  facts: Facts,
+): string | null {
+  const below = LADDER.slice(
+    LADDER.findIndex(({ block }) => block === verdict.block) + 1,
+  );
+
+  const loser = below.find(({ block, run }) => {
+    const condition = blocks[block];
+
+    return (
+      run !== verdict.run && condition && matchesCondition(condition, facts)
+    );
   });
+
+  return loser?.block ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,19 +360,75 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A job's `when` is a list of predicates, not the single mapping an override
- * takes, so the common case — one label — still reads as one line of YAML.
+ * Reads one `run:` or `skip:` block.
+ *
+ * `allowDiff` is false for an override, whose whole point is to settle the run
+ * before anyone has worked out what changed; a `paths:` there would be a
+ * condition that can never be honestly answered, so it is an error rather than
+ * something that quietly never matches.
  */
-function parseJobWhen(value: unknown, job: string): Predicate[] | undefined {
-  if (value === undefined) {
-    return undefined;
+export function parseCondition(
+  value: unknown,
+  where: string,
+  allowDiff = true,
+): Condition {
+  if (!isRecord(value)) {
+    throw new Error(`${where} must be a mapping of conditions`);
   }
 
-  if (!Array.isArray(value) || !value.every(isRecord)) {
-    throw new Error(`job "${job}".when must be a list of \`when\` mappings`);
+  const { condition: mode = "all", ...rest } = value;
+
+  if (mode !== "all" && mode !== "any") {
+    throw new Error(`${where}.condition must be all | any`);
   }
 
-  return value as Predicate[];
+  const predicates: Record<string, unknown> = {};
+
+  for (const [name, raw] of Object.entries(rest)) {
+    const spec = PREDICATES[name];
+
+    if (!spec) {
+      throw new Error(
+        `${where} has unknown condition "${name}", expected one of ${Object.keys(PREDICATES).join(", ")}`,
+      );
+    }
+
+    if (spec.needsDiff && !allowDiff) {
+      throw new Error(
+        `${where} cannot use "${name}" — an override is decided before the diff is worked out`,
+      );
+    }
+
+    predicates[name] = spec.parse(raw, `${where}.${name}`);
+  }
+
+  if (Object.keys(predicates).length === 0) {
+    throw new Error(`${where} needs at least one condition`);
+  }
+
+  return { mode, predicates };
+}
+
+/** Reads whichever of `rungs` blocks are present, for jobs and overrides alike. */
+function parseBlocks(
+  raw: Record<string, unknown>,
+  where: string,
+  rungs: readonly { block: keyof Blocks }[],
+  allowDiff: boolean,
+): Blocks {
+  const blocks: Blocks = {};
+
+  for (const { block } of rungs) {
+    if (raw[block] !== undefined) {
+      blocks[block] = parseCondition(
+        raw[block],
+        `${where}.${block}`,
+        allowDiff,
+      );
+    }
+  }
+
+  return blocks;
 }
 
 export function parseConfig(source: string): PlanConfig {
@@ -215,18 +451,23 @@ export function parseConfig(source: string): PlanConfig {
 
     const id = typeof raw.id === "string" ? raw.id : `override-${index}`;
 
-    if (raw.decision !== "run" && raw.decision !== "skip") {
-      throw new Error(`override "${id}" needs decision: run | skip`);
+    for (const { block, override } of LADDER) {
+      if (!override && raw[block] !== undefined) {
+        throw new Error(
+          `override "${id}" cannot use \`${block}\` — that is a workflow level setting, and an override already outranks everything a workflow says`,
+        );
+      }
     }
 
-    if (!isRecord(raw.when)) {
-      throw new Error(`override "${id}" needs a \`when\` mapping`);
+    if (OVERRIDE_BLOCKS.every(({ block }) => raw[block] === undefined)) {
+      throw new Error(
+        `override "${id}" needs a ${OVERRIDE_BLOCKS.map(({ block }) => `\`${block}\``).join(" or ")} block`,
+      );
     }
 
     return {
       id,
-      when: raw.when as Predicate,
-      decision: raw.decision,
+      ...parseBlocks(raw, `override "${id}"`, OVERRIDE_BLOCKS, false),
       reason: typeof raw.reason === "string" ? raw.reason : id,
     } satisfies Override;
   });
@@ -245,23 +486,18 @@ export function parseConfig(source: string): PlanConfig {
     const jobs: Record<string, JobConfig> = {};
 
     for (const [job, rawJob] of Object.entries(rawWorkflow.jobs)) {
-      // `job:` with nothing under it parses as null, and means "no options".
+      // `job:` with nothing under it parses as null, and means "no conditions".
       const options = rawJob ?? {};
 
       if (!isRecord(options)) {
         throw new Error(`job "${workflow}/${job}" must be a mapping`);
       }
 
-      if (options.paths !== undefined) {
-        stringList(options.paths, `${workflow}/${job}.paths`);
-      }
+      const where = `job "${workflow}/${job}"`;
 
       jobs[job] = {
-        calls: parseCalls(options, `${workflow}/${job}`),
-        paths: options.paths as string[] | undefined,
-        when: parseJobWhen(options.when, `${workflow}/${job}`),
-        exempt: options.exempt === true,
-        gate: options.gate === true,
+        calls: parseCalls(options, where),
+        ...parseBlocks(options, where, LADDER, true),
       };
     }
 
@@ -276,64 +512,55 @@ export function parseConfig(source: string): PlanConfig {
 /** `calls` is the whole of a job's configuration, so nothing may sit beside it. */
 function parseCalls(
   options: Record<string, unknown>,
-  job: string,
+  where: string,
 ): string | undefined {
   if (options.calls === undefined) {
     return undefined;
   }
 
   if (typeof options.calls !== "string") {
-    throw new Error(`job "${job}".calls must be the name of a workflow`);
+    throw new Error(`${where}.calls must be the name of a workflow`);
   }
 
-  const clashes = ["paths", "when", "exempt", "gate"].filter(
-    (key) => options[key] !== undefined,
+  const clashes = LADDER.map(({ block }) => block).filter(
+    (block) => options[block] !== undefined,
   );
 
   if (clashes.length > 0) {
     throw new Error(
-      `job "${job}" cannot combine \`calls\` with ${clashes.join(", ")} — the jobs of the called workflow decide whether it runs`,
+      `${where} cannot combine \`calls\` with ${clashes.join(", ")} — the jobs of the called workflow decide whether it runs`,
     );
   }
 
   return options.calls;
 }
 
-/**
- * A called workflow has to be described here, and has to carry its own gate.
- * The caller cannot verify it: a caller's `needs` context only ever holds the
- * called workflow's overall result, never the jobs inside it, so a nested job
- * that the plan asked for and that never ran would go unnoticed.
- */
+/** A called workflow has to be described here, or nothing can plan its jobs. */
 function validateCalls(workflows: PlanConfig["workflows"]): void {
   for (const [workflow, jobs] of Object.entries(workflows)) {
     for (const [job, options] of Object.entries(jobs)) {
-      if (options.calls === undefined) {
-        continue;
-      }
-
-      const called = workflows[options.calls];
-
-      if (!called) {
+      if (options.calls !== undefined && !workflows[options.calls]) {
         throw new Error(
           `job "${workflow}/${job}" calls workflow "${options.calls}", which is not described here — add it under \`workflows\``,
-        );
-      }
-
-      if (!Object.values(called).some((option) => option.gate)) {
-        throw new Error(
-          `workflow "${options.calls}" is called by "${workflow}/${job}", so it needs a \`gate\` job of its own — a caller cannot see the jobs inside it`,
         );
       }
     }
   }
 }
 
+/** Every `paths` group a job filters on, wherever in its config it sits. */
+function pathGroups(options: JobConfig): string[] {
+  return LADDER.flatMap(
+    ({ block }) =>
+      (options[block]?.predicates.paths as string[] | undefined) ?? [],
+  );
+}
+
 /** Catches a `paths` group that no longer exists in the paths-filter config. */
 export function validateGroups(config: PlanConfig, known: string[]): void {
   for (const [workflow, jobs] of Object.entries(config.workflows)) {
     for (const [job, options] of Object.entries(jobs)) {
-      for (const group of options.paths ?? []) {
+      for (const group of pathGroups(options)) {
         if (!known.includes(group)) {
           throw new Error(
             `job "${workflow}/${job}" filters on unknown path group "${group}", expected one of ${known.join(", ")}`,
@@ -348,63 +575,69 @@ export function validateGroups(config: PlanConfig, known: string[]): void {
 // Creating a plan
 // ---------------------------------------------------------------------------
 
+/** A settled answer: what was decided, and what to blame it on. */
+export type Decision = { id: string; run: boolean; reason: string };
+
+/**
+ * The first override whose `run` or `skip` matches, which then applies to
+ * every job in every workflow — an override outranks everything a workflow
+ * says about itself, `force-skip` included.
+ *
+ * It is tested against the context alone: `paths` is barred from an override
+ * at parse time, so the empty diff handed in here is never consulted.
+ */
 export function selectOverride(
   config: PlanConfig,
   context: PlanContext,
-): Override | null {
-  return (
-    config.overrides.find((override) =>
-      matchesPredicate(override.when, context),
-    ) ?? null
-  );
-}
+): Decision | null {
+  const facts: Facts = { ...context, changedGroups: [] };
 
-/** `labels: [a, b], branch: [main]` — an override's `when` as one line. */
-function describePredicate(predicate: Predicate): string {
-  return Object.entries(predicate)
-    .map(([name, value]) => `${name}: ${[value].flat().join(", ")}`)
-    .join(" and ");
+  for (const override of config.overrides) {
+    const verdict = weigh(override, facts);
+
+    if (verdict) {
+      return { id: override.id, run: verdict.run, reason: override.reason };
+    }
+  }
+
+  return null;
 }
 
 export function planJob(
   options: JobConfig,
-  context: PlanContext,
-  override: Override | null,
-  changedGroups: string[],
+  facts: Facts,
+  override: Decision | null,
 ): JobPlan {
-  if (options.gate) {
-    return { run: true, reason: "gate job, always runs" };
-  }
-
-  if (options.exempt) {
-    return { run: true, reason: "exempt from filters, always runs" };
-  }
-
-  // A job's own `when` is a conditional `exempt`, and sits where `exempt` does:
-  // asking for a job by label is asking for it to run, so it outranks a blanket
-  // skip in the same way. Nothing here can turn a job off — a `when` that does
-  // not match just leaves the path filter to decide as it would have.
-  const wanted = options.when?.find((predicate) =>
-    matchesPredicate(predicate, context),
-  );
-
-  if (wanted) {
-    return { run: true, reason: `asked for by ${describePredicate(wanted)}` };
-  }
-
+  // Overrides always take precedence over every workflow level setting, which
+  // is the outer rule: `force-skip` tops the ladder below, not this.
   if (override) {
-    return { run: override.decision === "run", reason: override.reason };
+    return { run: override.run, reason: override.reason };
   }
 
-  if (options.paths === undefined) {
-    return { run: true, reason: "no path filter" };
+  const verdict = weigh(options, facts);
+
+  if (verdict) {
+    const reason = `${verdict.block} condition met: ${describeMatched(verdict.condition, verdict.hits, facts)}`;
+    const loser = overruled(options, verdict, facts);
+
+    return {
+      run: verdict.run,
+      reason: loser
+        ? `${reason} (which beats the matching ${loser} condition)`
+        : reason,
+    };
   }
 
-  const hits = options.paths.filter((group) => changedGroups.includes(group));
+  // A `run:` block is the condition for running, so failing to match it is a
+  // skip. With no `run:` block at all there was never anything to satisfy.
+  if (options.run) {
+    return {
+      run: false,
+      reason: `no run condition met: ${describeCondition(options.run)}`,
+    };
+  }
 
-  return hits.length > 0
-    ? { run: true, reason: `changed: ${hits.join(", ")}` }
-    : { run: false, reason: `no changes in ${options.paths.join(", ")}` };
+  return { run: true, reason: "no conditions, always runs" };
 }
 
 /** The id the plan carries when everything ran because the diff failed. */
@@ -421,10 +654,9 @@ export const DIFF_FAILED = "diff-failed";
  * everything is the only honest answer, since the alternative is skipping jobs
  * on no evidence at all.
  */
-const diffFailed: Override = {
+const diffFailed: Decision = {
   id: DIFF_FAILED,
-  when: {},
-  decision: "run",
+  run: true,
   reason: "could not work out what changed, so everything runs",
 };
 
@@ -439,9 +671,8 @@ const diffFailed: Override = {
  */
 function planWorkflows(
   config: PlanConfig,
-  context: PlanContext,
-  override: Override | null,
-  changedGroups: string[],
+  facts: Facts,
+  override: Decision | null,
 ): Record<string, WorkflowPlan> {
   const planned: Record<string, WorkflowPlan> = {};
   const calling: string[] = [];
@@ -474,18 +705,13 @@ function planWorkflows(
     for (const [job, options] of Object.entries(jobConfigs)) {
       jobs[job] = options.calls
         ? planCall(options.calls, planWorkflow(options.calls))
-        : planJob(options, context, override, changedGroups);
+        : planJob(options, facts, override);
     }
 
     calling.pop();
 
-    // A workflow is worth running when it has real work in it — a gate or an
-    // exempt bookkeeping job on its own does not count.
     const workflowPlan: WorkflowPlan = {
-      run: Object.entries(jobs).some(
-        ([job, plan]) =>
-          plan.run && !jobConfigs[job]?.gate && !jobConfigs[job]?.exempt,
-      ),
+      run: Object.values(jobs).some((plan) => plan.run),
       jobs,
     };
 
@@ -534,9 +760,8 @@ export function createPlan(
 
   const workflows = planWorkflows(
     config,
-    context,
+    { ...context, changedGroups: changes?.changedGroups ?? [] },
     override,
-    changes?.changedGroups ?? [],
   );
 
   return {
@@ -662,23 +887,20 @@ export type Check = {
  * A planned job has to have succeeded. A job the plan skipped has to have been
  * skipped: if it ran anyway the plan and the workflow have drifted apart, and
  * that is worth failing on even when the job passed.
+ *
+ * Only the jobs the plan names are checked, in both directions — the job doing
+ * the verifying, and anything else the plan does not govern, is not in its own
+ * `needs` and so never shows up in `results` to begin with.
  */
 export function verifyPlan(
   plan: TestPlan,
   workflow: string,
   results: Results,
-  config?: PlanConfig,
 ): Check[] {
   const jobs = lookupWorkflow(plan, workflow).jobs;
-  const gates = config?.workflows[workflow] ?? {};
   const checks: Check[] = [];
 
   for (const [job, jobPlan] of Object.entries(jobs)) {
-    // The gate job is the one running this check, so it is never in `needs`.
-    if (gates[job]?.gate) {
-      continue;
-    }
-
     const result = results[job]?.result ?? "missing";
 
     if (jobPlan.run) {
@@ -691,7 +913,7 @@ export function verifyPlan(
           result === "success"
             ? jobPlan.reason
             : result === "missing"
-              ? "planned to run but is not in `needs` — wire it into the gate job"
+              ? "planned to run but is not in `needs` — wire it into the verify job"
               : `planned to run (${jobPlan.reason}) but ${result}`,
       });
       continue;
@@ -773,7 +995,7 @@ function pullRequestSource(
   return {
     context: {
       event: "pull_request",
-      // The branch under test, which `branch` predicates match against — for
+      // The branch under test, which `branch` conditions match against — for
       // a pull request that is the head, not the branch it will merge into.
       ref: view.headRefName,
       baseRef: view.baseRefName,
@@ -1021,9 +1243,6 @@ async function executeCommand(options: Options): Promise<number> {
 }
 
 async function verifyCommand(options: Options): Promise<number> {
-  const configPath = one(options, "config") ?? ".github/test-plan.yaml";
-  const config = parseConfig(await Bun.file(configPath).text());
-
   const plan = parsePlan(await readSource(required(options, "plan")));
   const workflow = required(options, "workflow");
 
@@ -1034,7 +1253,6 @@ async function verifyCommand(options: Options): Promise<number> {
     plan,
     workflow,
     JSON.parse(resultsSource) as Results,
-    config,
   );
 
   const lines = checks.map(
@@ -1144,7 +1362,6 @@ export const COMMANDS: Record<string, Command> = {
       ["--workflow <name>", "the workflow whose jobs to check"],
       ["--results <json>", "the `needs` context, as JSON"],
       ["--results-file <path|->", "the same, read from a file or stdin"],
-      ["--config <path>", "plan config (default: .github/test-plan.yaml)"],
     ],
     examples: [
       'test-plan.ts verify --plan plan.json --workflow ci --results "$RESULTS"',
