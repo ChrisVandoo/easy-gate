@@ -20,9 +20,15 @@ override: (none)
 
 RUN  ci
   RUN  plan         exempt from filters, always runs
-  RUN  lint         changed: workflows
-  SKIP test         no changes in src
+  RUN  lint         the lint workflow has jobs to run
+  SKIP test         nothing to run in the test workflow
   RUN  required     gate job, always runs
+RUN  lint
+  RUN  lint         changed: workflows
+  RUN  verify       gate job, always runs
+SKIP test
+  SKIP test         no changes in src
+  RUN  verify       gate job, always runs
 RUN  info
   RUN  plan         exempt from filters, always runs
   RUN  debug        changed: workflows
@@ -69,11 +75,18 @@ workflows:
   ci:
     jobs:
       test:
+        calls: test      # this job's body is `uses: ./.github/workflows/test.yml`
+      required:
+        gate: true       # always runs, and does the verifying
+
+  test:                  # ...and the workflow it calls is described here too
+    jobs:
+      test:
         paths: [src]     # runs when the `src` group changed
         when:
           - labels: [deep-test]   # ...and whenever this label is on the PR
-      required:
-        gate: true       # always runs, and does the verifying
+      verify:
+        gate: true
 ```
 
 A job with no `paths` is unconditional; `exempt: true` opts it out of overrides
@@ -91,10 +104,56 @@ off: an entry that does not match simply leaves the path filter to decide.
 ```
 RUN  ci
   RUN  plan         exempt from filters, always runs
-  SKIP lint         no changes in src, workflows
-  RUN  test         asked for by labels: deep-test
+  SKIP lint         nothing to run in the lint workflow
+  RUN  test         the test workflow has jobs to run
   RUN  required     gate job, always runs
+RUN  test
+  RUN  test         asked for by labels: deep-test
+  RUN  verify       gate job, always runs
 ```
+
+#### Workflows that call workflows
+
+A workflow called with `uses:` is described here like any other, so one file
+still answers "why did this run?" for the whole tree. The calling job gets
+`calls:` and nothing else — it decides nothing of its own, it runs exactly when
+the workflow it names has work in it. So a nested job's path filter reaches all
+the way up, and a `deep-test` label on a job three levels down is what makes the
+job at the top run:
+
+```
+RUN  ci
+  RUN  test         the test workflow has jobs to run
+RUN  test
+  RUN  test         asked for by labels: deep-test
+```
+
+A called workflow has to carry a `gate` of its own, and `parseConfig` refuses
+one that doesn't. This is not a style rule: a caller's `needs` context holds the
+called workflow's *overall* result and never the jobs inside it, so the caller
+cannot tell whether a nested job the plan asked for actually ran. The called
+workflow checks that itself, against the same plan — the caller passes it down
+as a `workflow_call` input rather than anyone deriving it twice — and a mismatch
+surfaces upward as that workflow failing.
+
+#### The size ceiling
+
+`create` refuses to emit a plan over 1 MB, which is what a job output can carry
+— and the plan is a job output before it is anything else, read back out of
+`needs` by every `if:` and handed down to each called workflow on top of that.
+
+```
+The plan is 1748 KB, over the 1024 KB a job output can carry.
+```
+
+Failing here is deliberate. A plan that does not arrive intact does not fail at
+the far end: `fromJSON` cannot read it, every `if:` consulting it comes out
+false, and the run skips everything while reporting success. A loud failure with
+no plan beats a quiet green run that tested nothing.
+
+Only `changedFiles` grows without bound, so hitting this almost always means the
+base is wrong rather than the change being genuinely enormous — check what
+`--base` resolved to first.
 
 `labels` and `branch` match on globs, so each entry is either a plain name,
 which has to match exactly, or a pattern — `*` stopping at a `/` and `**` not:

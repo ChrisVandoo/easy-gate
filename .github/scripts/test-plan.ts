@@ -83,6 +83,13 @@ export type Override = {
 };
 
 export type JobConfig = {
+  /**
+   * The workflow this job calls, for a job whose whole body is `uses:`. Such a
+   * job decides nothing itself — it runs exactly when the workflow it calls has
+   * work in it — so the called workflow's own jobs, described here like any
+   * other, are what settle it.
+   */
+  calls?: string;
   paths?: string[];
   /**
    * Conditions that make this job run whatever the diff says. Any one of them
@@ -255,6 +262,7 @@ export function parseConfig(source: string): PlanConfig {
       }
 
       jobs[job] = {
+        calls: parseCalls(options, `${workflow}/${job}`),
         paths: options.paths as string[] | undefined,
         when: parseJobWhen(options.when, `${workflow}/${job}`),
         exempt: options.exempt === true,
@@ -265,7 +273,65 @@ export function parseConfig(source: string): PlanConfig {
     workflows[workflow] = jobs;
   }
 
+  validateCalls(workflows);
+
   return { overrides, workflows };
+}
+
+/** `calls` is the whole of a job's configuration, so nothing may sit beside it. */
+function parseCalls(
+  options: Record<string, unknown>,
+  job: string,
+): string | undefined {
+  if (options.calls === undefined) {
+    return undefined;
+  }
+
+  if (typeof options.calls !== "string") {
+    throw new Error(`job "${job}".calls must be the name of a workflow`);
+  }
+
+  const clashes = ["paths", "when", "exempt", "gate"].filter(
+    (key) => options[key] !== undefined,
+  );
+
+  if (clashes.length > 0) {
+    throw new Error(
+      `job "${job}" cannot combine \`calls\` with ${clashes.join(", ")} — the jobs of the called workflow decide whether it runs`,
+    );
+  }
+
+  return options.calls;
+}
+
+/**
+ * A called workflow has to be described here, and has to carry its own gate.
+ * The caller cannot verify it: a caller's `needs` context only ever holds the
+ * called workflow's overall result, never the jobs inside it, so a nested job
+ * that the plan asked for and that never ran would go unnoticed.
+ */
+function validateCalls(workflows: PlanConfig["workflows"]): void {
+  for (const [workflow, jobs] of Object.entries(workflows)) {
+    for (const [job, options] of Object.entries(jobs)) {
+      if (options.calls === undefined) {
+        continue;
+      }
+
+      const called = workflows[options.calls];
+
+      if (!called) {
+        throw new Error(
+          `job "${workflow}/${job}" calls workflow "${options.calls}", which is not described here — add it under \`workflows\``,
+        );
+      }
+
+      if (!Object.values(called).some((option) => option.gate)) {
+        throw new Error(
+          `workflow "${options.calls}" is called by "${workflow}/${job}", so it needs a \`gate\` job of its own — a caller cannot see the jobs inside it`,
+        );
+      }
+    }
+  }
 }
 
 /** Catches a `paths` group that no longer exists in the paths-filter config. */
@@ -368,6 +434,88 @@ const diffFailed: Override = {
 };
 
 /**
+ * Plans every workflow, and a called one before its caller.
+ *
+ * Calls are what let one config govern workflows that call each other: the
+ * calling job is not planned from its own options, it simply takes the answer
+ * the called workflow arrived at, which is the same "is there real work here?"
+ * rule a top-level workflow uses. So a nested job's path filter reaches all the
+ * way up, and there is one place to look to see why any of it ran.
+ */
+function planWorkflows(
+  config: PlanConfig,
+  context: PlanContext,
+  override: Override | null,
+  changedGroups: string[],
+): Record<string, WorkflowPlan> {
+  const planned: Record<string, WorkflowPlan> = {};
+  const calling: string[] = [];
+
+  const planWorkflow = (workflow: string): WorkflowPlan => {
+    const done = planned[workflow];
+
+    if (done) {
+      return done;
+    }
+
+    if (calling.includes(workflow)) {
+      throw new Error(
+        `workflow "${workflow}" ends up calling itself: ${[...calling, workflow].join(" -> ")}`,
+      );
+    }
+
+    const jobConfigs = config.workflows[workflow];
+
+    if (!jobConfigs) {
+      throw new Error(
+        `workflow "${workflow}" is called but not described in the config`,
+      );
+    }
+
+    calling.push(workflow);
+
+    const jobs: Record<string, JobPlan> = {};
+
+    for (const [job, options] of Object.entries(jobConfigs)) {
+      jobs[job] = options.calls
+        ? planCall(options.calls, planWorkflow(options.calls))
+        : planJob(options, context, override, changedGroups);
+    }
+
+    calling.pop();
+
+    // A workflow is worth running when it has real work in it — a gate or an
+    // exempt bookkeeping job on its own does not count.
+    const workflowPlan: WorkflowPlan = {
+      run: Object.entries(jobs).some(
+        ([job, plan]) =>
+          plan.run && !jobConfigs[job]?.gate && !jobConfigs[job]?.exempt,
+      ),
+      jobs,
+    };
+
+    planned[workflow] = workflowPlan;
+
+    return workflowPlan;
+  };
+
+  // Planned depth-first, but reported in the order the config lists them, so
+  // reading a plan follows the same path as reading the file it came from.
+  return Object.fromEntries(
+    Object.keys(config.workflows).map((workflow) => [
+      workflow,
+      planWorkflow(workflow),
+    ]),
+  );
+}
+
+function planCall(workflow: string, called: WorkflowPlan): JobPlan {
+  return called.run
+    ? { run: true, reason: `the ${workflow} workflow has jobs to run` }
+    : { run: false, reason: `nothing to run in the ${workflow} workflow` };
+}
+
+/**
  * `diff` is a thunk because an override settles every job on its own: on a
  * protected branch, or behind force-run or skip-all, there is no question left
  * for the diff to answer, so it is never asked. When it is asked and throws,
@@ -389,30 +537,12 @@ export function createPlan(
     }
   }
 
-  const workflows: Record<string, WorkflowPlan> = {};
-
-  for (const [workflow, jobConfigs] of Object.entries(config.workflows)) {
-    const jobs: Record<string, JobPlan> = {};
-
-    for (const [job, options] of Object.entries(jobConfigs)) {
-      jobs[job] = planJob(
-        options,
-        context,
-        override,
-        changes?.changedGroups ?? [],
-      );
-    }
-
-    // A workflow is worth running when it has real work in it — a gate or an
-    // exempt bookkeeping job on its own does not count.
-    workflows[workflow] = {
-      run: Object.entries(jobs).some(
-        ([job, plan]) =>
-          plan.run && !jobConfigs[job]?.gate && !jobConfigs[job]?.exempt,
-      ),
-      jobs,
-    };
-  }
+  const workflows = planWorkflows(
+    config,
+    context,
+    override,
+    changes?.changedGroups ?? [],
+  );
 
   return {
     version: PLAN_VERSION,
@@ -425,6 +555,43 @@ export function createPlan(
     override: override?.id ?? null,
     workflows,
   };
+}
+
+/**
+ * How big a plan may get. GitHub caps a job output at 1 MB, and the plan is a
+ * job output before it is anything else — `ci` publishes it, every `if:` reads
+ * it back out of `needs`, and each called workflow takes it as a `workflow_call`
+ * input on top of that.
+ */
+export const MAX_PLAN_BYTES = 1024 * 1024;
+
+function describeBytes(bytes: number): string {
+  return `${(bytes / 1024).toFixed(bytes < 1024 * 10 ? 1 : 0)} KB`;
+}
+
+/**
+ * Turns a plan into the string CI passes around, refusing one too big to make
+ * the trip.
+ *
+ * Failing here is the point. A plan that does not arrive intact does not fail
+ * loudly at the far end: `fromJSON` cannot read it, every `if:` that consults
+ * it comes out false, and the run quietly skips everything while reporting
+ * success. Better to have no plan and say why than a plan nobody can read.
+ */
+export function serializePlan(
+  plan: TestPlan,
+  max: number = MAX_PLAN_BYTES,
+): string {
+  const json = JSON.stringify(plan);
+  const bytes = new TextEncoder().encode(json).length;
+
+  if (bytes > max) {
+    throw new Error(
+      `The plan is ${describeBytes(bytes)}, over the ${describeBytes(max)} a job output can carry.`,
+    );
+  }
+
+  return json;
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +973,7 @@ async function createCommand(options: Options): Promise<number> {
     : localSource(options, toDiff);
 
   const plan = createPlan(config, context, diff);
-  const json = JSON.stringify(plan);
+  const json = serializePlan(plan);
 
   if (one(options, "format") !== "json") {
     console.log(describePlan(plan));

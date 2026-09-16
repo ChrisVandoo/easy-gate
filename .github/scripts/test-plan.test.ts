@@ -8,6 +8,7 @@ import {
   type PlanContext,
   parseConfig,
   parsePlan,
+  serializePlan,
   validateGroups,
   verifyPlan,
 } from "./test-plan.ts";
@@ -342,6 +343,175 @@ describe("createPlan", () => {
   });
 });
 
+describe("createPlan with a called workflow", () => {
+  const nested = parseConfig(`
+overrides:
+  - id: skip-all
+    when:
+      labels: [skip-all]
+    decision: skip
+    reason: skip-all label is set
+
+workflows:
+  ci:
+    jobs:
+      plan:
+        exempt: true
+      test:
+        calls: test
+      required:
+        gate: true
+  test:
+    jobs:
+      unit:
+        paths: [src]
+      docs:
+        paths: [workflows]
+      verify:
+        gate: true
+`);
+
+  function planNested(changed: string[], labels: string[] = []) {
+    return createPlan(nested, context({ labels }), () => ({
+      changedFiles: changed.map((group) => `${group}/file.ts`),
+      changedGroups: changed,
+    }));
+  }
+
+  test("filters the called workflow's jobs in their own right", () => {
+    const plan = planNested(["src"]);
+
+    expect(lookupJob(plan, "test", "unit").run).toBe(true);
+    expect(lookupJob(plan, "test", "docs").run).toBe(false);
+  });
+
+  test("the calling job runs when the called workflow has work in it", () => {
+    const plan = planNested(["workflows"]);
+
+    expect(lookupJob(plan, "ci", "test")).toEqual({
+      run: true,
+      reason: "the test workflow has jobs to run",
+    });
+  });
+
+  test("the calling job is skipped when every nested job is", () => {
+    const plan = planNested([]);
+
+    expect(lookupJob(plan, "ci", "test")).toEqual({
+      run: false,
+      reason: "nothing to run in the test workflow",
+    });
+    // ...which is the whole point: the nested filter reaches the caller, so no
+    // runner is spent starting a workflow with nothing to do.
+    expect(plan.workflows.ci?.run).toBe(false);
+  });
+
+  test("an override reaches the nested jobs, and so the caller", () => {
+    const plan = planNested(["src"], ["skip-all"]);
+
+    expect(lookupJob(plan, "test", "unit").run).toBe(false);
+    expect(lookupJob(plan, "ci", "test").run).toBe(false);
+    // The gates still run, so the required check stays green.
+    expect(lookupJob(plan, "test", "verify").run).toBe(true);
+  });
+
+  test("a gate of its own does not make a workflow worth calling", () => {
+    expect(planNested(["workflows"]).workflows.test?.run).toBe(true);
+    expect(planNested([]).workflows.test?.run).toBe(false);
+  });
+
+  test("rejects a call to a workflow that cannot verify itself", () => {
+    expect(() =>
+      parseConfig(`
+workflows:
+  ci:
+    jobs:
+      test:
+        calls: test
+  test:
+    jobs:
+      unit:
+        paths: [src]
+`),
+    ).toThrow(/needs a `gate` job of its own/);
+  });
+
+  test("rejects a call to a workflow that is not described", () => {
+    expect(() =>
+      parseConfig(
+        "workflows:\n  ci:\n    jobs:\n      test:\n        calls: nope",
+      ),
+    ).toThrow(/not described here/);
+  });
+
+  test("rejects options sitting beside a call", () => {
+    expect(() =>
+      parseConfig(
+        "workflows:\n  ci:\n    jobs:\n      test:\n        calls: test\n        paths: [src]",
+      ),
+    ).toThrow(/cannot combine `calls` with paths/);
+  });
+
+  test("rejects a workflow that ends up calling itself", () => {
+    const cyclic = {
+      overrides: [],
+      workflows: {
+        a: { call: { calls: "b" }, verify: { gate: true } },
+        b: { call: { calls: "a" }, verify: { gate: true } },
+      },
+    };
+
+    expect(() =>
+      createPlan(cyclic, context(), () => ({
+        changedFiles: [],
+        changedGroups: [],
+      })),
+    ).toThrow(/ends up calling itself: a -> b -> a/);
+  });
+});
+
+describe("serializePlan", () => {
+  /** A plan whose `changedFiles` is `count` long, which is the only part of a
+   * plan that grows without bound. */
+  function planOf(count: number) {
+    return createPlan(config, context(), () => ({
+      changedFiles: Array.from(
+        { length: count },
+        (_, i) => `src/generated/file-${i}.ts`,
+      ),
+      changedGroups: ["src"],
+    }));
+  }
+
+  test("round-trips a plan of ordinary size", () => {
+    // One plan, not two: `createdAt` is stamped per call.
+    const plan = planOf(20);
+
+    expect(parsePlan(serializePlan(plan))).toEqual(plan);
+  });
+
+  test("refuses a plan too big for CI to pass between jobs", () => {
+    // Over 1 MB of file names, which is what a job output can carry.
+    expect(() => serializePlan(planOf(60_000))).toThrow(
+      /over the 1024 KB a job output can carry/,
+    );
+  });
+
+  test("reports both sizes, so it is clear how far over it is", () => {
+    expect(() => serializePlan(planOf(100), 1024)).toThrow(
+      /The plan is [\d.]+ KB, over the 1.0 KB/,
+    );
+  });
+
+  test("lets a plan exactly at the limit through", () => {
+    const plan = planOf(10);
+    const bytes = new TextEncoder().encode(serializePlan(plan)).length;
+
+    expect(() => serializePlan(plan, bytes)).not.toThrow();
+    expect(() => serializePlan(plan, bytes - 1)).toThrow();
+  });
+});
+
 describe("parsePlan", () => {
   test("rejects an empty plan", () => {
     expect(() => parsePlan("  ")).toThrow(/plan is empty/);
@@ -461,7 +631,9 @@ describe("verifyPlan", () => {
 // The plan is only trustworthy if it describes the workflows that actually
 // exist, so check the real files against each other rather than waiting for a
 // run to fail.
-type WorkflowFile = { jobs: Record<string, { needs?: string | string[] }> };
+type WorkflowFile = {
+  jobs: Record<string, { needs?: string | string[]; uses?: string }>;
+};
 
 const realConfig = parseConfig(await Bun.file(".github/test-plan.yaml").text());
 const realFilters = parseFilters(
@@ -494,10 +666,18 @@ describe("the checked-in config", () => {
     },
   );
 
-  test("the gate job needs every job it has to verify", () => {
-    const jobs = realConfig.workflows.ci ?? {};
+  // Every workflow that verifies itself, which is every workflow with a gate:
+  // ci, and each workflow ci calls.
+  test.each(
+    Object.keys(realConfig.workflows).filter((name) =>
+      Object.values(realConfig.workflows[name] ?? {}).some(
+        (options) => options.gate,
+      ),
+    ),
+  )("%s's gate job needs every job it has to verify", (name) => {
+    const jobs = realConfig.workflows[name] ?? {};
     const gate = Object.keys(jobs).find((job) => jobs[job]?.gate);
-    const needs = realWorkflows.ci?.jobs[gate ?? ""]?.needs ?? [];
+    const needs = realWorkflows[name]?.jobs[gate ?? ""]?.needs ?? [];
 
     expect(gate).toBeDefined();
     expect([needs].flat().sort()).toEqual(
@@ -505,5 +685,30 @@ describe("the checked-in config", () => {
         .filter((job) => !jobs[job]?.gate)
         .sort(),
     );
+  });
+
+  // A `calls` that names the wrong workflow would plan one workflow and gate
+  // another, and both would look fine on their own.
+  test("every `calls` job really is a call, to the workflow it names", () => {
+    for (const [name, jobs] of Object.entries(realConfig.workflows)) {
+      for (const [job, options] of Object.entries(jobs)) {
+        if (options.calls === undefined) {
+          continue;
+        }
+
+        expect(realWorkflows[name]?.jobs[job]?.uses).toBe(
+          `./.github/workflows/${options.calls}.yml`,
+        );
+      }
+    }
+  });
+
+  test("it plans, so nothing in it calls a workflow that is not there", () => {
+    expect(() =>
+      createPlan(realConfig, context(), () => ({
+        changedFiles: [],
+        changedGroups: [],
+      })),
+    ).not.toThrow();
   });
 });

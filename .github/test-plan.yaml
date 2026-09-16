@@ -45,7 +45,9 @@ overrides:
 # the inputs, so it is not an override: `create` tries the diff, and if it
 # fails the plan runs everything and records why.
 
-# Every workflow the plan governs, and the jobs inside it.
+# Every workflow the plan governs, and the jobs inside it — including the ones
+# a workflow calls, so that this file is the whole picture and nothing decides
+# whether it runs anywhere else.
 #
 # A job runs when any of its `paths` groups changed. The groups come from
 # .github/paths-filter.yaml, and an unknown group is an error. A job with no
@@ -59,6 +61,13 @@ overrides:
 #                     outranks a blanket skip, so a job asked for here runs
 #                     even under skip-all. It can only turn a job on: an entry
 #                     that does not match leaves the path filter to decide.
+#   calls:  <name>  — for a job whose body is `uses:`, the workflow it calls.
+#                     It decides nothing of its own, so nothing else may sit
+#                     beside it: it runs exactly when that workflow has work in
+#                     it, which its jobs below settle. A called workflow needs
+#                     a `gate` of its own, because a caller's `needs` only ever
+#                     sees the called workflow's overall result — never the
+#                     jobs inside it — so it cannot verify them.
 #   exempt: true    — always runs, ignoring overrides and path filters
 #   gate:   true    — implies exempt, and excludes the job from verification
 #                     (this is the job that does the verifying)
@@ -68,12 +77,26 @@ workflows:
       plan:
         exempt: true
       lint:
+        calls: lint
+      test:
+        calls: test
+      required:
+        gate: true
+
+  lint:
+    jobs:
+      lint:
         paths: [src, workflows]
+      verify:
+        gate: true
+
+  test:
+    jobs:
       test:
         paths: [src]
         when:
           - labels: [deep-test]
-      required:
+      verify:
         gate: true
 
   info:
