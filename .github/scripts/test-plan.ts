@@ -12,7 +12,8 @@
  * flags directly, so the same command run on a laptop and in CI produces the
  * same plan. `execute` answers a single should-this-run question. `verify` is
  * the required check: it takes the plan and the `needs` context and confirms
- * every job the plan asked for actually ran and passed.
+ * every job the plan asked for actually ran and passed. `sync` keeps the list
+ * of jobs in the config honest by reading it back off the workflow files.
  *
  * The flags live with the commands themselves, at the bottom of this file:
  * run `test-plan.ts --help`, or `test-plan.ts <command> --help`.
@@ -572,6 +573,363 @@ export function validateGroups(config: PlanConfig, known: string[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Syncing the config with the workflows
+// ---------------------------------------------------------------------------
+
+/**
+ * A workflow file, as far as the config is concerned: what jobs there are,
+ * which of them are a call, and which of them are the plan's own machinery.
+ */
+type RawJob = { uses?: unknown; steps?: unknown };
+
+/** One job of a workflow, as the workflow file describes it. */
+export type ScaffoldJob = { job: string; calls?: string };
+
+/** Every workflow reached from the entry one, in the order they were reached. */
+export type Scaffold = Record<string, ScaffoldJob[]>;
+
+/**
+ * How a job spells a call to a workflow in this repository. A `uses:` that
+ * points anywhere else names a workflow whose jobs are not ours to describe,
+ * so it stays a job like any other rather than becoming a `calls`.
+ */
+const LOCAL_WORKFLOW = /^\.?\/?\.github\/workflows\/([\w.-]+)\.ya?ml$/;
+
+/** This script, as a workflow step spells it. */
+const PLAN_SCRIPT = "test-plan.ts";
+
+/**
+ * True for the job that builds the plan and the job that checks it afterwards.
+ * Neither can be governed by the plan — one runs before there is a plan to
+ * consult, and the other has to run whatever the plan said — so the config
+ * leaves them out, and a sync has to leave them out too.
+ */
+function runsThePlan(job: RawJob): boolean {
+  return (
+    Array.isArray(job.steps) &&
+    job.steps.some(
+      (step) =>
+        isRecord(step) &&
+        typeof step.run === "string" &&
+        step.run.includes(PLAN_SCRIPT),
+    )
+  );
+}
+
+function parseWorkflowFile(
+  source: string,
+  workflow: string,
+): Record<string, RawJob> {
+  const parsed = Bun.YAML.parse(source);
+
+  if (!isRecord(parsed) || !isRecord(parsed.jobs)) {
+    throw new Error(`workflow "${workflow}" has no \`jobs\` mapping`);
+  }
+
+  const jobs: Record<string, RawJob> = {};
+
+  for (const [job, raw] of Object.entries(parsed.jobs)) {
+    if (!isRecord(raw)) {
+      throw new Error(`job "${workflow}/${job}" must be a mapping`);
+    }
+
+    jobs[job] = raw;
+  }
+
+  return jobs;
+}
+
+/**
+ * The jobs of a workflow and of every workflow it calls, however deep the
+ * calls go.
+ *
+ * This is the half of the config the workflow files already know: what jobs
+ * there are, and which of them are nothing but a call. The other half — when
+ * any of it runs — is not in the workflows at all any more, which is the whole
+ * point of the config, so nothing here invents one.
+ */
+export async function scaffoldWorkflows(
+  entry: string,
+  read: (workflow: string) => Promise<string>,
+): Promise<Scaffold> {
+  const scaffold: Scaffold = {};
+  const calling: string[] = [];
+
+  const walk = async (workflow: string): Promise<void> => {
+    if (calling.includes(workflow)) {
+      throw new Error(
+        `workflow "${workflow}" ends up calling itself: ${[...calling, workflow].join(" -> ")}`,
+      );
+    }
+
+    if (scaffold[workflow]) {
+      return;
+    }
+
+    calling.push(workflow);
+
+    const jobs = Object.entries(
+      parseWorkflowFile(await read(workflow), workflow),
+    )
+      .filter(([, raw]) => !runsThePlan(raw))
+      .map(([job, raw]) => {
+        const calls =
+          typeof raw.uses === "string"
+            ? LOCAL_WORKFLOW.exec(raw.uses)?.[1]
+            : undefined;
+
+        return calls === undefined ? { job } : { job, calls };
+      });
+
+    // Recorded before the calls are followed, so the entry workflow leads and
+    // a called one lands next to the caller that reached it.
+    scaffold[workflow] = jobs;
+
+    for (const { calls } of jobs) {
+      if (calls !== undefined) {
+        await walk(calls);
+      }
+    }
+
+    calling.pop();
+  };
+
+  await walk(entry);
+
+  return scaffold;
+}
+
+// A config is read back as text rather than as YAML, because what is being
+// kept is the text: the conditions someone wrote, in the shape they wrote
+// them, with the comments explaining why. Parsing and re-emitting would lose
+// all three. The indents are fixed by the format, so the keys can be found by
+// how far in they sit.
+const WORKFLOW_INDENT = 2;
+const JOB_INDENT = 6;
+
+type Section = { start: number; end: number };
+
+/**
+ * Where the `workflows:` block sits, as a half-open range of line indices. It
+ * runs to the next line starting in the first column — the next top-level key,
+ * or the comment introducing it — and never includes the blank lines before it.
+ */
+function workflowsSection(lines: string[]): Section | null {
+  const start = lines.findIndex((line) => /^workflows:(\s|$)/.test(line));
+
+  if (start === -1) {
+    return null;
+  }
+
+  let end = lines.length;
+
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^\S/.test(lines[i] as string)) {
+      end = i;
+      break;
+    }
+  }
+
+  while (end > start + 1 && (lines[end - 1] as string).trim() === "") {
+    end -= 1;
+  }
+
+  return { start, end };
+}
+
+type KeyLine = { line: number; indent: number; key: string };
+
+function keyLines(lines: string[], { start, end }: Section): KeyLine[] {
+  const keys: KeyLine[] = [];
+
+  for (let i = start; i < end; i += 1) {
+    const match = /^(\s*)([\w.-]+):(?:\s|$)/.exec(lines[i] as string);
+
+    if (match) {
+      keys.push({
+        line: i,
+        indent: (match[1] as string).length,
+        key: match[2] as string,
+      });
+    }
+  }
+
+  return keys;
+}
+
+/** What a config already says about each job, by workflow and then by job. */
+export type ExistingJobs = Record<string, Record<string, string[]>>;
+
+/**
+ * The lines under every job an existing config describes, exactly as they are
+ * written. A job with nothing under it gets an empty list, which is still the
+ * config saying something: that the job runs unconditionally.
+ */
+export function existingJobs(config: string): ExistingJobs {
+  const lines = config.split("\n");
+  const section = workflowsSection(lines);
+
+  if (!section) {
+    return {};
+  }
+
+  const keys = keyLines(lines, { start: section.start + 1, end: section.end });
+  const existing: ExistingJobs = {};
+  let workflow: string | null = null;
+
+  keys.forEach((entry, index) => {
+    if (entry.indent === WORKFLOW_INDENT) {
+      workflow = entry.key;
+      existing[workflow] ??= {};
+      return;
+    }
+
+    if (entry.indent !== JOB_INDENT || workflow === null) {
+      return;
+    }
+
+    // The job's body runs to the next job, the next workflow, or the end.
+    const next = keys.slice(index + 1).find((key) => key.indent <= JOB_INDENT);
+    const body = lines.slice(entry.line + 1, next?.line ?? section.end);
+
+    while (body.length > 0 && (body.at(-1) as string).trim() === "") {
+      body.pop();
+    }
+
+    (existing[workflow] as Record<string, string[]>)[entry.key] = body;
+  });
+
+  return existing;
+}
+
+function callsIn(body: string[] | undefined): string | undefined {
+  for (const line of body ?? []) {
+    const match = /^\s*calls:\s*(\S+)\s*$/.exec(line);
+
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * What goes under a job.
+ *
+ * A call is read straight off the workflow file, since its `uses:` is the only
+ * thing that decides it. Everything else is whatever the config already said,
+ * copied across untouched — that is the part a person wrote, and a sync that
+ * quietly dropped it would turn a careful path filter into "always runs"
+ * without anyone noticing.
+ */
+function jobLines(calls: string | undefined, body: string[]): string[] {
+  if (calls !== undefined) {
+    return [`${" ".repeat(JOB_INDENT + 2)}calls: ${calls}`];
+  }
+
+  // A job that no longer calls anything keeps its conditions but not the call.
+  return body.filter((line) => !/^\s*calls:\s/.test(line));
+}
+
+/** The `workflows:` block, as the config file spells it. */
+export function renderWorkflows(scaffold: Scaffold, config = ""): string {
+  const existing = existingJobs(config);
+
+  const blocks = Object.entries(scaffold).map(([workflow, jobs]) => {
+    const lines = [`${" ".repeat(WORKFLOW_INDENT)}${workflow}:`];
+
+    // A workflow whose every job is the plan's own machinery has nothing for
+    // the config to decide, but it is still a workflow, and `jobs` is required.
+    if (jobs.length === 0) {
+      return [...lines, `${" ".repeat(WORKFLOW_INDENT + 2)}jobs: {}`].join(
+        "\n",
+      );
+    }
+
+    lines.push(`${" ".repeat(WORKFLOW_INDENT + 2)}jobs:`);
+
+    for (const { job, calls } of jobs) {
+      lines.push(`${" ".repeat(JOB_INDENT)}${job}:`);
+      lines.push(...jobLines(calls, existing[workflow]?.[job] ?? []));
+    }
+
+    return lines.join("\n");
+  });
+
+  return ["workflows:", blocks.join("\n\n")].join("\n");
+}
+
+/** The config with `workflows:` replaced, or given one if it had none. */
+export function withWorkflows(config: string, block: string): string {
+  const lines = config.split("\n");
+  const section = workflowsSection(lines);
+
+  if (!section) {
+    const before = config.trimEnd();
+
+    return before.length === 0 ? `${block}\n` : `${before}\n\n${block}\n`;
+  }
+
+  return [
+    ...lines.slice(0, section.start),
+    ...block.split("\n"),
+    ...lines.slice(section.end),
+  ].join("\n");
+}
+
+/**
+ * What the sync did to the config, a line per job. Nothing else reports this:
+ * the conditions are kept verbatim, so a job appearing or disappearing is the
+ * whole of what changed, and it is the thing worth reading before committing.
+ */
+export function describeSync(
+  scaffold: Scaffold,
+  existing: ExistingJobs,
+): string[] {
+  const changes: string[] = [];
+
+  for (const [workflow, jobs] of Object.entries(scaffold)) {
+    const before = existing[workflow];
+
+    if (!before) {
+      changes.push(`+ workflow ${workflow}`);
+    }
+
+    for (const { job, calls } of jobs) {
+      const body = before?.[job];
+
+      if (body === undefined) {
+        changes.push(`+ job ${workflow}/${job}`);
+        continue;
+      }
+
+      const was = callsIn(body);
+
+      if (was !== calls) {
+        changes.push(
+          `~ job ${workflow}/${job} ${calls ? `now calls ${calls}` : "no longer calls anything"}`,
+        );
+      }
+    }
+
+    for (const job of Object.keys(before ?? {})) {
+      if (!jobs.some((entry) => entry.job === job)) {
+        changes.push(`- job ${workflow}/${job}`);
+      }
+    }
+  }
+
+  for (const workflow of Object.keys(existing)) {
+    if (!scaffold[workflow]) {
+      changes.push(`- workflow ${workflow}`);
+    }
+  }
+
+  return changes;
+}
+
+// ---------------------------------------------------------------------------
 // Creating a plan
 // ---------------------------------------------------------------------------
 
@@ -1049,6 +1407,13 @@ function localSource(
 
 export type Options = Record<string, string[]>;
 
+/**
+ * The flags that are simply on or off, and so take no value. Everything else
+ * needs one, which is what turns a typo like `--pr --repo x` into an error
+ * rather than a plan for the pull request named "--repo".
+ */
+const SWITCHES = new Set(["write"]);
+
 export function parseArgs(argv: string[]): Options {
   const options: Options = {};
 
@@ -1060,6 +1425,16 @@ export function parseArgs(argv: string[]): Options {
     }
 
     const [flag, inlineValue] = splitFlag(arg.slice(2));
+
+    if (SWITCHES.has(flag)) {
+      if (inlineValue !== undefined) {
+        throw new Error(`--${flag} takes no value`);
+      }
+
+      options[flag] = ["true"];
+      continue;
+    }
+
     const value = inlineValue ?? argv[++i];
 
     if (value === undefined) {
@@ -1096,6 +1471,11 @@ function one(options: Options, flag: string): string | undefined {
 /** Every value given for a repeatable flag, in the order they were given. */
 function many(options: Options, flag: string): string[] {
   return options[flag] ?? [];
+}
+
+/** Whether a switch was given at all, which is the whole of what it says. */
+function enabled(options: Options, flag: string): boolean {
+  return options[flag] !== undefined;
 }
 
 function required(options: Options, flag: string): string {
@@ -1242,6 +1622,72 @@ async function executeCommand(options: Options): Promise<number> {
   return 0;
 }
 
+/** The directory a workflow file sits in, and the name it goes by. */
+function workflowLocation(path: string): { dir: string; name: string } {
+  const slash = path.lastIndexOf("/");
+  const dir = slash === -1 ? "." : path.slice(0, slash);
+  const file = path.slice(slash + 1);
+  const name = file.replace(/\.ya?ml$/, "");
+
+  if (name === file) {
+    throw new Error(`--workflow must be a .yml or .yaml file, got "${path}"`);
+  }
+
+  return { dir, name };
+}
+
+/**
+ * Reads a called workflow by name. A `uses:` names a file, but the config, the
+ * plan and every error in them name a workflow, so the name is what travels
+ * and the extension is looked for here.
+ */
+function workflowReader(dir: string): (workflow: string) => Promise<string> {
+  return async (workflow) => {
+    for (const extension of [".yml", ".yaml"]) {
+      const file = Bun.file(`${dir}/${workflow}${extension}`);
+
+      if (await file.exists()) {
+        return await file.text();
+      }
+    }
+
+    throw new Error(`no ${dir}/${workflow}.yml to read workflow "${workflow}"`);
+  };
+}
+
+async function syncCommand(options: Options): Promise<number> {
+  const configPath = one(options, "config") ?? ".github/test-plan.yaml";
+  const { dir, name } = workflowLocation(required(options, "workflow"));
+
+  const scaffold = await scaffoldWorkflows(name, workflowReader(dir));
+  const configFile = Bun.file(configPath);
+  const config = (await configFile.exists()) ? await configFile.text() : "";
+  const updated = withWorkflows(config, renderWorkflows(scaffold, config));
+
+  // A sync that produced a config nobody can read would be found out by the
+  // next run rather than by the person doing the syncing.
+  parseConfig(updated);
+
+  const changes = describeSync(scaffold, existingJobs(config));
+
+  console.error(changes.length > 0 ? changes.join("\n") : "already in sync");
+
+  if (!enabled(options, "write")) {
+    console.log(updated.trimEnd());
+    return 0;
+  }
+
+  if (updated === config) {
+    console.log(`${configPath} is already up to date`);
+    return 0;
+  }
+
+  await Bun.write(configPath, updated);
+  console.log(`wrote ${configPath}`);
+
+  return 0;
+}
+
 async function verifyCommand(options: Options): Promise<number> {
   const plan = parsePlan(await readSource(required(options, "plan")));
   const workflow = required(options, "workflow");
@@ -1346,6 +1792,30 @@ export const COMMANDS: Record<string, Command> = {
     examples: [
       "test-plan.ts execute --plan plan.json --workflow ci",
       "test-plan.ts execute --plan - --workflow lint --job lint",
+    ],
+  },
+  sync: {
+    run: syncCommand,
+    summary: "make the config's `workflows:` match the workflow files",
+    args: "--workflow <path> [--config <path>] [--write]",
+    description: [
+      "Reads a workflow file and every workflow it calls, however deep the",
+      "calls go, and writes out the `workflows:` block they describe: each",
+      "job, and, for a job that is a call, the workflow it calls. Conditions",
+      "already in the config are kept exactly as they are, comments and all",
+      "— the workflow files say what jobs there are, and you say when they",
+      "run. The jobs that build the plan and check it afterwards are left",
+      "out, since the plan cannot govern them. Prints the updated config,",
+      "and lists what changed on stderr.",
+    ],
+    flags: [
+      ["--workflow <path>", "the workflow to read, with its calls followed"],
+      ["--config <path>", "plan config (default: .github/test-plan.yaml)"],
+      ["--write", "update the config in place instead of printing it"],
+    ],
+    examples: [
+      "test-plan.ts sync --workflow .github/workflows/ci.yml",
+      "test-plan.ts sync --workflow .github/workflows/ci.yml --write",
     ],
   },
   verify: {
