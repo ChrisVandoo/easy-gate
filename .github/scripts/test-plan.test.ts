@@ -4,6 +4,8 @@ import {
   COMMANDS,
   createPlan,
   DIFF_FAILED,
+  describeSync,
+  existingJobs,
   type Facts,
   lookupJob,
   matchesCondition,
@@ -12,10 +14,13 @@ import {
   parseCondition,
   parseConfig,
   parsePlan,
+  renderWorkflows,
+  scaffoldWorkflows,
   selectOverride,
   serializePlan,
   validateGroups,
   verifyPlan,
+  withWorkflows,
 } from "./test-plan.ts";
 
 const config = parseConfig(`
@@ -831,6 +836,188 @@ describe("verifyPlan", () => {
   });
 });
 
+describe("sync", () => {
+  const workflows: Record<string, string> = {
+    ci: `
+jobs:
+  plan:
+    steps:
+      - run: bun .github/scripts/test-plan.ts create --pr 1
+  lint:
+    uses: ./.github/workflows/lint.yml
+  build:
+    runs-on: ubuntu-latest
+  release:
+    uses: other/repo/.github/workflows/release.yml@v1
+`,
+    lint: `
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+  verify:
+    steps:
+      - run: bun .github/scripts/test-plan.ts verify --plan - --workflow lint
+`,
+  };
+
+  const reader =
+    (files: Record<string, string>) => async (workflow: string) => {
+      const source = files[workflow];
+
+      if (source === undefined) {
+        throw new Error(`no workflow "${workflow}"`);
+      }
+
+      return source;
+    };
+
+  const read = reader(workflows);
+
+  const config = `overrides:
+  - id: force-run
+    run:
+      labels: [force-run]
+    reason: force-run label is set
+
+workflows:
+  ci:
+    jobs:
+      lint:
+        calls: lint
+      build:
+        # only when something it builds changed
+        run:
+          paths: [src]
+      gone:
+        run:
+          paths: [src]
+
+  lint:
+    jobs:
+      lint:
+`;
+
+  test("takes the jobs from the workflow and follows its calls", async () => {
+    expect(await scaffoldWorkflows("ci", read)).toEqual({
+      ci: [
+        { job: "lint", calls: "lint" },
+        { job: "build" },
+        { job: "release" },
+      ],
+      lint: [{ job: "lint" }],
+    });
+  });
+
+  // A `uses:` into another repository names jobs this config cannot describe,
+  // so the job that calls it stays a job like any other.
+  test("only a call to a workflow of our own is a `calls`", async () => {
+    const scaffold = await scaffoldWorkflows("ci", read);
+
+    expect(scaffold.ci?.find((job) => job.job === "release")?.calls).toBe(
+      undefined,
+    );
+  });
+
+  test("leaves out the jobs that build the plan and check it", async () => {
+    const scaffold = await scaffoldWorkflows("ci", read);
+
+    expect(scaffold.ci?.map((job) => job.job)).not.toContain("plan");
+    expect(scaffold.lint?.map((job) => job.job)).not.toContain("verify");
+  });
+
+  test("refuses a workflow that ends up calling itself", async () => {
+    const loop = reader({
+      ci: "jobs:\n  call:\n    uses: ./.github/workflows/lint.yml\n",
+      lint: "jobs:\n  call:\n    uses: ./.github/workflows/ci.yml\n",
+    });
+
+    expect(scaffoldWorkflows("ci", loop)).rejects.toThrow("ci -> lint -> ci");
+  });
+
+  test("a workflow of nothing but plan machinery still has `jobs`", async () => {
+    const gate = reader({
+      gate: "jobs:\n  verify:\n    steps:\n      - run: bun test-plan.ts verify\n",
+    });
+    const rendered = renderWorkflows(await scaffoldWorkflows("gate", gate));
+
+    expect(rendered).toContain("jobs: {}");
+    expect(parseConfig(rendered).workflows).toEqual({ gate: {} });
+  });
+
+  test("keeps the conditions the config already had, comments and all", async () => {
+    const scaffold = await scaffoldWorkflows("ci", read);
+
+    expect(renderWorkflows(scaffold, config)).toBe(`workflows:
+  ci:
+    jobs:
+      lint:
+        calls: lint
+      build:
+        # only when something it builds changed
+        run:
+          paths: [src]
+      release:
+
+  lint:
+    jobs:
+      lint:`);
+  });
+
+  test("drops a job the workflow no longer has", async () => {
+    const scaffold = await scaffoldWorkflows("ci", read);
+
+    expect(renderWorkflows(scaffold, config)).not.toContain("gone");
+  });
+
+  // Nothing else would take it back out: `calls` says another workflow's jobs
+  // decide this one, and that stops being true the moment the `uses:` goes.
+  test("drops a `calls` the workflow no longer makes", () => {
+    expect(renderWorkflows({ ci: [{ job: "lint" }] }, config)).toBe(
+      "workflows:\n  ci:\n    jobs:\n      lint:",
+    );
+  });
+
+  test("leaves the rest of the config alone, and settles", async () => {
+    const scaffold = await scaffoldWorkflows("ci", read);
+    const updated = withWorkflows(config, renderWorkflows(scaffold, config));
+
+    expect(updated).toContain("reason: force-run label is set");
+    expect(updated.endsWith("\n")).toBe(true);
+    // Syncing an already synced config is a no-op, so --write is repeatable.
+    expect(withWorkflows(updated, renderWorkflows(scaffold, updated))).toBe(
+      updated,
+    );
+  });
+
+  test("gives a config with no `workflows:` at all one", () => {
+    const overrides = config.split("\nworkflows:")[0] as string;
+    const updated = withWorkflows(overrides, renderWorkflows({ ci: [] }));
+
+    expect(updated).toContain("reason: force-run label is set");
+    expect(parseConfig(updated).workflows).toEqual({ ci: {} });
+  });
+
+  test("reports what it did, a line per job", async () => {
+    expect(
+      describeSync(await scaffoldWorkflows("ci", read), existingJobs(config)),
+    ).toEqual(["+ job ci/release", "- job ci/gone"]);
+  });
+
+  test("reports a job that has become a call, and one that has stopped", () => {
+    expect(
+      describeSync(
+        { ci: [{ job: "lint" }, { job: "build", calls: "build" }] },
+        existingJobs(config),
+      ),
+    ).toEqual([
+      "~ job ci/lint no longer calls anything",
+      "~ job ci/build now calls build",
+      "- job ci/gone",
+      "- workflow lint",
+    ]);
+  });
+});
+
 // The plan is only trustworthy if it describes the workflows that actually
 // exist, so check the real files against each other rather than waiting for a
 // run to fail.
@@ -888,6 +1075,21 @@ describe("the checked-in config", () => {
         );
       }
     }
+  });
+
+  // The strongest form of the two checks above: not only does every job it
+  // names exist, it names every job there is, and calls what they call.
+  test("is exactly what a sync of the workflow files produces", async () => {
+    const source = await Bun.file(".github/test-plan.yaml").text();
+    const scaffold = await scaffoldWorkflows(
+      "ci",
+      async (workflow) =>
+        await Bun.file(`.github/workflows/${workflow}.yml`).text(),
+    );
+
+    expect(withWorkflows(source, renderWorkflows(scaffold, source))).toBe(
+      source,
+    );
   });
 
   test("it plans, so nothing in it calls a workflow that is not there", () => {
@@ -980,7 +1182,9 @@ describe("the CLI help", () => {
 
   test("every flag the script reads is documented", () => {
     const read = [
-      ...cliSource.matchAll(/(?:one|required|many)\(options, "([a-z-]+)"\)/g),
+      ...cliSource.matchAll(
+        /(?:one|required|many|enabled)\(options, "([a-z-]+)"\)/g,
+      ),
     ].map((match) => match[1] as string);
 
     expect([...new Set(read)].filter((flag) => !documented.has(flag))).toEqual(

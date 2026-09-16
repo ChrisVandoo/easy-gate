@@ -31,6 +31,11 @@ bun plan create --pr <pr #> --repo <owner/repo>
 ```
 to see what CI jobs will run.
 
+to create or update config file:
+```
+bun plan sync --workflow .github/workflows/ci.yml --write
+```
+
 example CI usage:
 - [ci.yml](.github/workflows/ci.yml)
 - [test-plan.yaml](.github/test-plan.yaml)
