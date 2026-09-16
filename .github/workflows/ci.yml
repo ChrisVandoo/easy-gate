@@ -13,7 +13,7 @@ jobs:
       src: ${{ steps.filter.outputs.src }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Enough history to diff against the base of the pull request.
           fetch-depth: 0
